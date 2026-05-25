@@ -14,6 +14,7 @@ from netcortex import __version__
 from netcortex.config import init_settings, get_settings
 from netcortex.state import AppState, AdapterStatus, state
 from netcortex.status.router import router as status_router
+from netcortex.webhooks.router import router as webhook_router
 
 log = structlog.get_logger(__name__)
 
@@ -373,6 +374,7 @@ async def _query_budget(request, call_next):
 
 
 app.include_router(status_router)
+app.include_router(webhook_router)
 
 
 # ── Prometheus-style /metrics endpoint ────────────────────────────────────────

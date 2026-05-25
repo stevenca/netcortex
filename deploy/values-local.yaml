@@ -26,9 +26,12 @@ existingSecret: "netcortex-bootstrap"
 ingress:
   enabled: true
   className: "nginx"       # Traefik handles 'nginx' class on this microk8s cluster
-  hostname: "netcortex.local"
+  hostname: "cpn-ful-netcortex1.ciscops.net"
   tls:
-    enabled: false
+    enabled: true
+    secretName: "netcortex-tls"
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
 
 # Tighten resources for a single-node dev cluster
 web:

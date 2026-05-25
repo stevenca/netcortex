@@ -1,0 +1,26 @@
+{{- if .Values.telemetry.grpc.enabled }}
+# gRPC dial-out MDT service (gNMI Subscribe, port 57500).
+# Network devices configured for gRPC telemetry dial-out connect here.
+# The actual gRPC receiver process is a future sidecar/deployment;
+# this Service ensures stable DNS and allows firewall pre-provisioning.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "netcortex.fullname" . }}-telemetry-grpc
+  labels:
+    {{- include "netcortex.labels" . | nindent 4 }}
+    app.kubernetes.io/component: telemetry-grpc
+  annotations:
+    # Remind operators that this port needs to be reachable from devices.
+    netcortex.io/telemetry: "gRPC MDT dial-out (gNMI Subscribe)"
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "netcortex.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: web
+  ports:
+    - name: grpc-mdt
+      port: {{ .Values.telemetry.grpc.port }}
+      targetPort: {{ .Values.telemetry.grpc.port }}
+      protocol: TCP
+{{- end }}

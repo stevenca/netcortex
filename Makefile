@@ -8,8 +8,8 @@ NAMESPACE   ?= netcortex
 HELM_VALUES  = deploy/helm/values.yaml
 LOCAL_VALUES = deploy/values-local.yaml
 
-.PHONY: help build push bootstrap-secret helm-install helm-upgrade helm-uninstall \
-        status logs shell
+.PHONY: help build push bootstrap-secret certmgr-secret helm-install helm-upgrade \
+        helm-uninstall status logs shell
 
 help:
 	@echo ""
@@ -36,8 +36,25 @@ push: build
 	docker push $(REGISTRY)/netcortex:$(TAG)
 
 # -----------------------------------------------------------------------------
-# Bootstrap secret — created from .env, never stored in Helm history
+# Secrets — created out-of-band, never stored in Helm history
 # -----------------------------------------------------------------------------
+certmgr-secret:
+	@export $$(grep -v '^#' .env | xargs -d '\n') && \
+	microk8s kubectl create secret generic route53-credentials \
+	  --from-literal=ACCESS_KEY_ID="$$AWS_ACCESS_KEY_ID" \
+	  --from-literal=SECRET_ACCESS_KEY="$$AWS_SECRET_ACCESS_KEY" \
+	  -n cert-manager \
+	  --dry-run=client -o yaml | microk8s kubectl apply -f - && \
+	microk8s kubectl apply -f deploy/cert-manager/cluster-issuer.yaml
+
+# Usage: make certmgr-patch-zoneid ZONE_ID=Z1234567890ABC
+certmgr-patch-zoneid:
+	@test -n "$(ZONE_ID)" || (echo "Usage: make certmgr-patch-zoneid ZONE_ID=Z..." && exit 1)
+	@sed -i 's|# hostedZoneID: Z1234567890ABC.*|hostedZoneID: $(ZONE_ID)|g' \
+	  deploy/cert-manager/cluster-issuer.yaml
+	microk8s kubectl apply -f deploy/cert-manager/cluster-issuer.yaml
+	@echo "✓ ClusterIssuers updated with hostedZoneID=$(ZONE_ID)"
+
 bootstrap-secret:
 	microk8s kubectl create namespace $(NAMESPACE) --dry-run=client -o yaml \
 	  | microk8s kubectl apply -f -

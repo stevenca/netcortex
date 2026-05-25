@@ -161,6 +161,18 @@ service:
   port: 8000
 
 # -----------------------------------------------------------------------------
+# Streaming telemetry
+# HTTP push MDT is handled inline by the web container on port 8000.
+# gRPC dial-out MDT (gNMI Subscribe) uses a separate service on port 57500.
+# The gRPC receiver is a future sidecar/deployment; setting enabled: true
+# creates the Service so DNS and firewall rules can be set up in advance.
+# -----------------------------------------------------------------------------
+telemetry:
+  grpc:
+    enabled: true
+    port: 57500      # IANA / Cisco standard for gNMI dial-out
+
+# -----------------------------------------------------------------------------
 # Ingress
 # On microk8s: className "nginx" (Traefik handles nginx/public/traefik classes)
 # On OpenShift: className "" and let the ingress operator pick it up, or use

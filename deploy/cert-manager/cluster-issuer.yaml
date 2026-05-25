@@ -1,0 +1,52 @@
+---
+# Route53 credentials for cert-manager DNS-01 solver.
+# Apply this AFTER ensuring the route53-credentials Secret exists in cert-manager ns:
+#   kubectl create secret generic route53-credentials \
+#     --from-literal=ACCESS_KEY_ID=<key> \
+#     --from-literal=SECRET_ACCESS_KEY=<secret> \
+#     -n cert-manager
+# Or via Makefile:  make certmgr-secret
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: stevenca@cisco.com
+    privateKeySecretRef:
+      name: letsencrypt-prod-account-key
+    solvers:
+      - dns01:
+          route53:
+            region: us-east-1
+            # hostedZoneID: Z1234567890ABC   # ← uncomment + set to skip ListHostedZones
+            accessKeyIDSecretRef:
+              name: route53-credentials
+              key: ACCESS_KEY_ID
+            secretAccessKeySecretRef:
+              name: route53-credentials
+              key: SECRET_ACCESS_KEY
+---
+# Staging issuer for testing without hitting Let's Encrypt rate limits.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: stevenca@cisco.com
+    privateKeySecretRef:
+      name: letsencrypt-staging-account-key
+    solvers:
+      - dns01:
+          route53:
+            region: us-east-1
+            # hostedZoneID: Z1234567890ABC   # ← uncomment + set to skip ListHostedZones
+            accessKeyIDSecretRef:
+              name: route53-credentials
+              key: ACCESS_KEY_ID
+            secretAccessKeySecretRef:
+              name: route53-credentials
+              key: SECRET_ACCESS_KEY
