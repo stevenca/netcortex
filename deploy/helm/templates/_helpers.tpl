@@ -77,6 +77,9 @@ namespace range; the Dockerfile's GID-0 chown keeps /app/data writable.
 */}}
 {{- define "netcortex.containerSecurityContext" -}}
 runAsNonRoot: {{ .Values.securityContext.runAsNonRoot }}
+{{- if .Values.securityContext.runAsUser }}
+runAsUser: {{ .Values.securityContext.runAsUser }}
+{{- end }}
 allowPrivilegeEscalation: {{ .Values.securityContext.allowPrivilegeEscalation }}
 capabilities:
   drop: {{ toJson .Values.securityContext.capabilities.drop }}

@@ -56,6 +56,10 @@ aws:
 # -----------------------------------------------------------------------------
 securityContext:
   runAsNonRoot: true
+  # UID 1001 matches the netcortex user in the Dockerfile.
+  # On OpenShift restricted SCC the platform overrides this with a namespace-
+  # assigned UID; set to null/omit via values override when targeting OCP.
+  runAsUser: 1001
   allowPrivilegeEscalation: false
   capabilities:
     drop: ["ALL"]

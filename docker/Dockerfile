@@ -31,8 +31,9 @@ RUN apt-get update \
         snmp \
     && rm -rf /var/lib/apt/lists/*
 
-# Non-root user (groupadd/useradd are in the base image)
-RUN groupadd -r netcortex && useradd -r -g netcortex netcortex
+# Non-root user with a fixed numeric UID so Kubernetes can verify runAsNonRoot.
+# UID 1001 is safe on Debian slim (outside the system-user range).
+RUN groupadd -r -g 1001 netcortex && useradd -r -u 1001 -g netcortex netcortex
 
 # Copy installed packages and console scripts from builder
 COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
@@ -48,7 +49,7 @@ RUN mkdir -p /app/data \
     && chown -R netcortex:0 /app/data \
     && chmod -R g=u /app/data
 
-USER netcortex
+USER 1001
 
 EXPOSE 8000
 
