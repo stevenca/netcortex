@@ -24,6 +24,20 @@ and this file MUST be updated together whenever `__version__` changes.
 
 ---
 
+## [Unreleased — 0.6.0-dev28]
+
+### Security (dev28)
+- **MCP bearer-token authentication** (`netcortex/main.py`).  The `/mcp/`
+  endpoint was previously open with no authentication.  A custom ASGI
+  middleware (`_MCPBearerAuth`) now validates every HTTP/WebSocket request
+  against the `mcp_secret` value from the core secret in AWS Secrets Manager.
+  Constant-time comparison (`hmac.compare_digest`) prevents timing-oracle
+  attacks on the token.  If `mcp_secret` is empty (default for new installs
+  without the key in the secret backend) the middleware is a no-op, preserving
+  backward compatibility for local/dev environments.
+  The token is read lazily on each request so secret rotation takes effect on
+  the next request without a pod restart.
+
 ## [Unreleased — 0.6.0-dev27]
 
 ### Fixed (dev27)

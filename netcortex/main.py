@@ -152,6 +152,49 @@ async def _refresh_graph_stats_loop(interval: int = 60) -> None:
 _MCP_ENABLED = os.environ.get("NETCORTEX_MCP_ENABLED", "1") not in ("0", "false", "False")
 _MCP_PATH    = os.environ.get("NETCORTEX_MCP_PATH", "/mcp").rstrip("/") or "/mcp"
 
+
+class _MCPBearerAuth:
+    """ASGI middleware: validate ``Authorization: Bearer <mcp_secret>``.
+
+    - If ``mcp_secret`` is empty (not set in the core secret) the middleware
+      is a no-op so local/dev environments can connect without a token.
+    - The secret is read lazily at request time so it picks up whatever
+      value ``init_settings()`` loaded from AWS SM / Vault during startup,
+      without needing the config to be ready at module-import time.
+    - Constant-time comparison (``hmac.compare_digest``) prevents
+      timing-oracle attacks on the token.
+    """
+
+    def __init__(self, app: object) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict, receive: object, send: object) -> None:
+        import hmac
+        from starlette.responses import Response
+
+        if scope["type"] in ("http", "websocket"):
+            try:
+                from netcortex.config import get_settings
+                secret = get_settings().mcp_secret or ""
+            except RuntimeError:
+                secret = ""
+
+            if secret:
+                headers = dict(scope.get("headers", []))
+                auth_header = headers.get(b"authorization", b"").decode()
+                token = auth_header.removeprefix("Bearer ").strip()
+                if not hmac.compare_digest(token, secret):
+                    resp = Response(
+                        "Unauthorized",
+                        status_code=401,
+                        headers={"WWW-Authenticate": 'Bearer realm="NetCortex MCP"'},
+                    )
+                    await resp(scope, receive, send)
+                    return
+
+        await self.app(scope, receive, send)
+
+
 _mcp_app = None
 if _MCP_ENABLED:
     try:
@@ -160,7 +203,8 @@ if _MCP_ENABLED:
         from netcortex.mcp.server import mcp as _mcp_instance
         # path="/" because the mount prefix already provides the
         # ``/mcp`` segment — relative path keeps the routes clean.
-        _mcp_app = _mcp_instance.http_app(path="/", transport="http")
+        _raw_mcp_app = _mcp_instance.http_app(path="/", transport="http")
+        _mcp_app = _MCPBearerAuth(_raw_mcp_app)
     except Exception as exc:
         log.error("netcortex.mcp.init_failed", error=str(exc))
         state.mcp_status = "error"
@@ -274,8 +318,10 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     # ── Nest the mounted MCP app's lifespan so its session manager
     # ── starts/stops cleanly with the FastAPI app.  Starlette doesn't
     # ── propagate lifespans into mounted sub-apps automatically.
+    # _mcp_app is _MCPBearerAuth wrapping _raw_mcp_app; lifespan is on
+    # the inner FastMCP ASGI app.
     if _mcp_app is not None:
-        async with _mcp_app.lifespan(app):
+        async with _raw_mcp_app.lifespan(app):
             yield
     else:
         yield
