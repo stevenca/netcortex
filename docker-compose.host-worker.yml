@@ -1,0 +1,25 @@
+services:
+  netcortex-worker:
+    # Use the host network namespace so the worker can reach private/SD-WAN
+    # IPs (e.g., 10.x.x.x, 100.64.x/10 CG-NAT, AutoVPN overlays) that the
+    # default Docker bridge cannot route to.
+    #
+    # USAGE:
+    #   docker compose -f docker-compose.yml -f docker-compose.host-worker.yml up -d netcortex-worker
+    #
+    # Notes:
+    #   * Host networking is Linux/macOS docker desktop only.
+    #   * In this mode container hostnames like "redis"/"neo4j" no longer
+    #     resolve — point the worker at the published host ports instead.
+    #   * Health-check shifts to localhost since "neo4j" hostname is gone.
+    network_mode: host
+    environment:
+      REDIS_URL: redis://127.0.0.1:6379/0
+      NEO4J_URI: bolt://127.0.0.1:7687
+      SYNC_BACKEND: celery
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 7687), 2).close()"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3

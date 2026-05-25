@@ -1,0 +1,36 @@
+---
+description: NetCortex project conventions and architecture guidance
+globs: netcortex/**/*.py, tests/**/*.py
+alwaysApply: true
+---
+
+# NetCortex Project Rules
+
+## Architecture
+- NetBox is the only persistent backend. Never introduce a separate database.
+- All credentials must be sourced from NetBox Secrets — never from environment variables or code.
+- Adapters are read-only from the platform perspective. Config push goes through the Access Layer.
+- The MCP layer is thin: tools delegate to adapters, the access layer, or the NetBox client — no business logic in tool files.
+
+## Adapter conventions
+- All adapters must implement `PlatformAdapter` from `netcortex.adapters.base`.
+- Adapters must be registered via `pyproject.toml` entry points under `netcortex.adapters`.
+- Platform-specific metadata that has no NetBox field goes in `NormalizedDevice.platform_metadata`.
+- Use `nc_platform_id` as the stable cross-reference key between platform and NetBox.
+
+## Code style
+- Python 3.12+, async/await throughout.
+- Pydantic v2 for all data models.
+- `structlog` for all logging — no `print()` or bare `logging` calls.
+- `httpx.AsyncClient` for all HTTP calls in adapters and the access layer.
+- Stub-first: implement the interface with `raise NotImplementedError` before filling in logic.
+
+## Testing
+- Tests live in `tests/` mirroring the package structure.
+- Use `pytest-asyncio` with `asyncio_mode = "auto"`.
+- Mock NetBox and platform API calls with `pytest-httpx`.
+
+## Docker
+- The main container runs `uvicorn netcortex.main:app`.
+- The worker container runs `python -m netcortex.worker`.
+- Never run as root inside containers.
