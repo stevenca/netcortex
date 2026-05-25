@@ -24,6 +24,47 @@ and this file MUST be updated together whenever `__version__` changes.
 
 ---
 
+## [Unreleased — 0.6.0-dev26]
+
+### Added (dev24)
+- **HTTPS / TLS via Let's Encrypt** — cert-manager addon enabled on MicroK8s;
+  `letsencrypt-prod` and `letsencrypt-staging` ClusterIssuers created with
+  Route53 DNS-01 solver; Traefik service patched with `externalIPs` so ports
+  80/443 bind on the host's public IP; Ingress updated to
+  `cpn-ful-netcortex1.ciscops.net` with TLS annotation.
+- **Webhook receivers** (`netcortex/webhooks/`) — FastAPI router mounted at
+  `/webhooks/*` with platform-specific handlers: Meraki (HMAC-SHA256 validated),
+  Catalyst Center (shared-token), Nexus Dashboard, and a generic catch-all.
+  Each handler queues a targeted adapter sync in a background task so webhook
+  callers receive an immediate 200.
+- **HTTP streaming telemetry ingest** — `POST /ingest/telemetry/{device_name}`
+  accepts HTTP dial-out MDT from IOS-XE/IOS-XR; `GET /ingest/telemetry/stream`
+  provides a Server-Sent Events feed of live ingest activity.
+- **gRPC telemetry Service** — `service-telemetry-grpc.yaml` Helm template
+  creates a ClusterIP Service on port 57500 for future gNMI dial-out MDT.
+- **Makefile targets**: `certmgr-secret`, `certmgr-patch-zoneid`.
+
+### Fixed (dev25)
+- **Aggregated topology `nonexistant target` error** — the edge query in
+  `get_aggregated_topology` lacked the stub filter present in the node query.
+  Stub devices with no site produced `agg:site:unassigned` edges that
+  referenced a node which was never emitted. Fixed by adding
+  `AND (a.stub IS NULL OR a.stub = false)` to both sides of the edge MATCH,
+  plus a Python-side safety net that drops any edge whose endpoint is absent
+  from the emitted node set.
+
+### Performance (dev26)
+- **30-second in-process result cache** for `get_full_graph` — cold call takes
+  ~13 s on a large graph; warm (cache hit) returns in ~30 ms (400× speedup).
+  Cache is keyed on all query parameters and stampede-protected with
+  `asyncio.Event`. `POST /api/graph/cache/invalidate` forces immediate expiry.
+- **`Device.canonical_id` index** added to `schema.py` (and created live);
+  this property is referenced in every duplicate-device filter query.
+- **Query budgets raised** — `/api/graph` 10 s → 45 s (accommodates cold-cache
+  compute); other graph endpoints 10 s → 15 s.
+
+---
+
 ## [Unreleased — 0.6.0-dev23]
 
 ### Feature: Network-aware topology layout (WAN-rooted tiers + orphan column)

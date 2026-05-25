@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "netcortex"
-version = "0.6.0.dev23"
+version = "0.6.0.dev26"
 description = "The intelligence layer for your network — multi-dimensional graph of the network bridging Meraki, Catalyst Center, Intersight, and more with NetBox as SoT"
 readme = "README.md"
 requires-python = ">=3.12"
