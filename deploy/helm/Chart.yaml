@@ -1,0 +1,14 @@
+apiVersion: v2
+name: netcortex
+description: The intelligence layer for your network — MCP server, sync engine, and platform adapters
+type: application
+version: 0.1.0
+appVersion: "0.6.0"
+keywords:
+  - network
+  - mcp
+  - netbox
+  - cisco
+home: https://github.com/stevenca/netcortex
+sources:
+  - https://github.com/stevenca/netcortex

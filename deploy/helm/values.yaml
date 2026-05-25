@@ -1,0 +1,186 @@
+# =============================================================================
+# NetCortex Helm Chart — Default Values
+# =============================================================================
+# Override with -f values-local.yaml or --set for environment-specific config.
+# Sensitive values (AWS keys, etc.) are NEVER stored here — supply them via
+# existingSecret or a separate values override that you keep out of git.
+# =============================================================================
+
+nameOverride: ""
+fullnameOverride: ""
+
+# -----------------------------------------------------------------------------
+# Image
+# -----------------------------------------------------------------------------
+image:
+  repository: localhost:32000/netcortex   # microk8s local registry default
+  tag: latest
+  pullPolicy: Always
+
+imagePullSecrets: []
+
+# -----------------------------------------------------------------------------
+# Bootstrap secret (Phase 1 — only these land in the environment)
+# All other config/credentials are pulled from the secret backend at startup.
+#
+# Option A (recommended): create the Secret out-of-band and set existingSecret.
+#   kubectl create secret generic netcortex-bootstrap \
+#     --from-env-file=.env -n netcortex
+#
+# Option B: let the chart manage it (store overrides in a gitignored file).
+# -----------------------------------------------------------------------------
+existingSecret: ""   # set to the Secret name to use Option A
+
+secretBackend: aws_sm
+
+aws:
+  region: us-east-1
+  secretPrefix: netcortex
+  # Set these only when NOT using an IAM instance role / IRSA / pod identity.
+  # Prefer existingSecret so these never appear in Helm release history.
+  accessKeyId: ""
+  secretAccessKey: ""
+  sessionToken: ""
+  # For LocalStack / dev override:
+  # endpointUrl: http://localstack:4566
+
+# -----------------------------------------------------------------------------
+# Global container security context
+# Designed to satisfy OpenShift "restricted" SCC:
+#   - runAsNonRoot: true (no UID specified — OCP assigns one from namespace range)
+#   - allowPrivilegeEscalation: false
+#   - capabilities.drop: ALL
+#   - seccompProfile: RuntimeDefault
+# Note: redis and neo4j images use fixed UIDs (999 / 7474). On OCP restricted
+# SCC those may be rejected; grant anyuid SCC to the SA or use Bitnami images.
+# -----------------------------------------------------------------------------
+securityContext:
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+  seccompProfile:
+    type: RuntimeDefault
+
+# -----------------------------------------------------------------------------
+# Web — main FastAPI / MCP server
+# -----------------------------------------------------------------------------
+web:
+  replicas: 1
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"
+  # Extra environment variables (non-secret)
+  extraEnv: []
+  # - name: LOG_LEVEL
+  #   value: DEBUG
+
+# -----------------------------------------------------------------------------
+# Worker — Celery async task runner
+# -----------------------------------------------------------------------------
+worker:
+  enabled: true
+  replicas: 1
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+  extraEnv: []
+
+# -----------------------------------------------------------------------------
+# Redis
+# -----------------------------------------------------------------------------
+redis:
+  enabled: true
+  image:
+    repository: redis
+    tag: "7-alpine"
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "128Mi"
+  persistence:
+    size: 1Gi
+    storageClass: ""   # "" = cluster default
+
+# -----------------------------------------------------------------------------
+# Neo4j
+# -----------------------------------------------------------------------------
+neo4j:
+  enabled: true
+  image:
+    repository: neo4j
+    tag: "5-community"
+  auth:
+    # Set to true and provide password for production.
+    # false → NEO4J_AUTH=none (dev only)
+    enabled: false
+    password: ""
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+    limits:
+      cpu: "2000m"
+      memory: "2Gi"
+  persistence:
+    data:
+      size: 10Gi
+      storageClass: ""
+    logs:
+      size: 1Gi
+      storageClass: ""
+
+# -----------------------------------------------------------------------------
+# NetCortex app data volume (/app/data)
+# -----------------------------------------------------------------------------
+persistence:
+  data:
+    size: 5Gi
+    storageClass: ""
+
+# -----------------------------------------------------------------------------
+# Service
+# -----------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 8000
+
+# -----------------------------------------------------------------------------
+# Ingress
+# On microk8s: className "nginx" (Traefik handles nginx/public/traefik classes)
+# On OpenShift: className "" and let the ingress operator pick it up, or use
+#               a Route resource instead (add to templates/ when targeting OCP).
+# -----------------------------------------------------------------------------
+ingress:
+  enabled: true
+  className: "nginx"
+  hostname: "netcortex.local"
+  tls:
+    enabled: false
+    secretName: "netcortex-tls"
+  annotations: {}
+  # OpenShift Route example (add when targeting OCP):
+  # annotations:
+  #   route.openshift.io/termination: edge
+
+# -----------------------------------------------------------------------------
+# Service Account
+# -----------------------------------------------------------------------------
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # For IRSA (EKS) or Workload Identity (GKE/AKS):
+  # annotations:
+  #   eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/netcortex

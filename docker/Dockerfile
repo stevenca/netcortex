@@ -41,7 +41,12 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 # Copy source
 COPY --chown=netcortex:netcortex . .
 
-RUN mkdir -p /app/data && chown netcortex:netcortex /app/data
+RUN mkdir -p /app/data \
+    # OpenShift runs containers as a random UID in GID 0 (root group).
+    # Granting group ownership + g=u ensures the process can write /app/data
+    # regardless of which UID the platform assigns at runtime.
+    && chown -R netcortex:0 /app/data \
+    && chmod -R g=u /app/data
 
 USER netcortex
 

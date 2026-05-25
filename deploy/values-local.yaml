@@ -1,0 +1,61 @@
+# =============================================================================
+# Local microk8s development overrides
+# =============================================================================
+# Usage:
+#   make helm-install
+# Or manually:
+#   microk8s helm3 upgrade --install netcortex deploy/helm/ \
+#     --namespace netcortex --create-namespace \
+#     -f deploy/helm/values.yaml \
+#     -f deploy/values-local.yaml
+#
+# This file is safe to commit — no secrets are stored here.
+# AWS credentials are in the 'netcortex-bootstrap' Secret created by:
+#   make bootstrap-secret
+# =============================================================================
+
+image:
+  repository: localhost:32000/netcortex
+  tag: latest
+  pullPolicy: Always
+
+# Reference the out-of-band Secret (created from .env by 'make bootstrap-secret').
+# This keeps credentials out of Helm release history.
+existingSecret: "netcortex-bootstrap"
+
+ingress:
+  enabled: true
+  className: "nginx"       # Traefik handles 'nginx' class on this microk8s cluster
+  hostname: "netcortex.local"
+  tls:
+    enabled: false
+
+# Tighten resources for a single-node dev cluster
+web:
+  replicas: 1
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+worker:
+  replicas: 1
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "300m"
+      memory: "384Mi"
+
+neo4j:
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"

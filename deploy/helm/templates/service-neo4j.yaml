@@ -1,0 +1,24 @@
+{{- if .Values.neo4j.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "netcortex.fullname" . }}-neo4j
+  labels:
+    {{- include "netcortex.labels" . | nindent 4 }}
+    app.kubernetes.io/component: neo4j
+spec:
+  type: ClusterIP
+  clusterIP: None   # headless — StatefulSet pods get stable DNS via serviceName
+  selector:
+    {{- include "netcortex.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: neo4j
+  ports:
+    - name: bolt
+      port: 7687
+      targetPort: 7687
+      protocol: TCP
+    - name: http
+      port: 7474
+      targetPort: 7474
+      protocol: TCP
+{{- end }}
