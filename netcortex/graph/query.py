@@ -587,8 +587,19 @@ async def _get_full_graph_impl(  # noqa: C901 — intentionally large function
             all_rels = [e.value for e in EdgeType if e.value not in excluded]
             rel_pattern = f"[r:{'|'.join(all_rels)}]"
 
+        # Three-way site filter so the query matches however the device is placed:
+        #   1. PlatformSite slug (e.g. Meraki/CATC sites that carry the slug directly)
+        #   2. Site slug       (NetBox site node — up to 3 hops for nested containers)
+        #   3. netbox_site_slug property — fastest path for devices that are in an
+        #      "unassigned" adapter bucket but correctly tagged by the NetBox adapter.
+        #      Example: a Cat8k in Catalyst Center's "unassigned" bucket still carries
+        #      netbox_site_slug='cpn-ful' and must appear when the user filters cpn-ful.
         site_filter = (
-            "WHERE (src)-[:LOCATED_AT*1..2]->(:PlatformSite {slug: $site})"
+            "WHERE ("
+            "  (src)-[:LOCATED_AT*1..2]->(:PlatformSite {slug: $site})"
+            "  OR (src)-[:LOCATED_AT*1..3]->(:Site {slug: $site})"
+            "  OR src.netbox_site_slug = $site"
+            ")"
         ) if site else ""
 
         records: list[dict] = []

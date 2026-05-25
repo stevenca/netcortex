@@ -40,6 +40,7 @@ _INDEXES: list[tuple[str, str]] = [
     ("Device", "snmp_polled"),       # status panel filter
     ("Device", "stub"),              # inventory excludes stubs
     ("Device", "canonical_id"),      # duplicate-device filter (used in every topology query)
+    ("Device", "netbox_site_slug"),  # site-filter fallback for unassigned-bucket devices
     ("Device", "source_adapter"),    # per-adapter scoped queries
     ("Interface", "device_id"),
     ("Interface", "mac"),

@@ -24,6 +24,25 @@ and this file MUST be updated together whenever `__version__` changes.
 
 ---
 
+## [Unreleased — 0.6.0-dev27]
+
+### Fixed (dev27)
+- **Site-filtered topology omits devices in adapter "unassigned" buckets**
+  (`netcortex/graph/query.py`).  The Cypher `site_filter` previously matched only
+  `(:PlatformSite {slug: $site})`.  Devices that Catalyst Center (or another
+  adapter) placed in an "unassigned" platform-site (e.g.
+  `catc-site:unassigned:cpn-ful-catc1`) were invisible when the user drilled into
+  the `cpn-ful` site view even though NetBox had them correctly tagged with
+  `netbox_site_slug = 'cpn-ful'`.  The filter now uses a three-way OR:
+  1. `PlatformSite {slug}` — existing adapter-site match.
+  2. `Site {slug}` — NetBox site node (up to 3 hops).
+  3. `src.netbox_site_slug = $site` — direct property lookup on the device;
+     fastest path for unassigned-bucket devices.
+  A matching index on `Device.netbox_site_slug` was added to `schema.py` so the
+  new OR branch does not perform a full node scan.
+  Concrete example: `cpn-ful-cat8k1` and `cpn-ful-cat8k2` now appear in the
+  `cpn-ful` topology view.
+
 ## [Unreleased — 0.6.0-dev26]
 
 ### Added (dev24)
