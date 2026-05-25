@@ -1086,11 +1086,14 @@ async def get_aggregated_topology(
                 })
 
             # Edges between sites = any link where the two endpoints live in
-            # different containers.  Keep PHYSICAL_LINK + SDWAN_TUNNEL only.
+            # different containers.  Apply the same stub/canonical filters as
+            # the node query so we never reference a node that wasn't emitted.
             r2 = await session.run(
                 """
                 MATCH (a:Device)-[r:PHYSICAL_LINK|SDWAN_TUNNEL|VXLAN_TUNNEL|BGP_PEER]->(b:Device)
                 WHERE a.canonical_id IS NULL AND b.canonical_id IS NULL
+                  AND (a.stub IS NULL OR a.stub = false)
+                  AND (b.stub IS NULL OR b.stub = false)
                 OPTIONAL MATCH (a)-[:LOCATED_AT]->(psa)
                 OPTIONAL MATCH (b)-[:LOCATED_AT]->(psb)
                 WITH coalesce(psa.id, 'unassigned') AS sa,
@@ -1100,19 +1103,28 @@ async def get_aggregated_topology(
                 RETURN sa, sb, rel, count(*) AS weight
                 """
             )
-            edges = [
-                {
+
+            # Build a set of valid node IDs for the safety-net filter below.
+            node_ids = {n["data"]["id"] for n in nodes}
+
+            edges = []
+            async for r in r2:
+                src = f"agg:site:{r['sa']}"
+                tgt = f"agg:site:{r['sb']}"
+                # Drop any edge whose endpoint wasn't emitted as a node
+                # (guards against future query drift or unexpected graph state).
+                if src not in node_ids or tgt not in node_ids:
+                    continue
+                edges.append({
                     "data": {
                         "id": f"agg:{r['rel']}:{r['sa']}->{r['sb']}",
-                        "source": f"agg:site:{r['sa']}",
-                        "target": f"agg:site:{r['sb']}",
+                        "source": src,
+                        "target": tgt,
                         "rel_type": r["rel"],
                         "weight": r["weight"],
                         "label": f"{r['weight']} {r['rel']}",
                     }
-                }
-                async for r in r2
-            ]
+                })
             return {"level": level, "nodes": nodes, "edges": edges,
                     "node_count": len(nodes), "edge_count": len(edges),
                     "truncated": False}
