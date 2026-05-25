@@ -11,6 +11,10 @@ which gives us plain Python dicts with no driver-object coercion needed.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
+import time
 from typing import Any
 
 import structlog
@@ -19,6 +23,30 @@ from netcortex.graph.client import get_driver
 from netcortex.graph.models import Dimension, EdgeType, NodeType
 
 log = structlog.get_logger(__name__)
+
+# ---------------------------------------------------------------------------
+# Short-lived in-process result cache for the full-graph query.
+#
+# The /api/graph query scans all relationships in Neo4j and can take 10-30 s
+# on a large graph.  Caching the response for 30 s means the UI gets a
+# sub-millisecond reply on every reload after the first fetch.
+#
+# Key: SHA-256 hex of the frozen parameter dict (overlays, site, limit …).
+# Value: (result_dict, expiry_monotonic_time).
+# ---------------------------------------------------------------------------
+_GRAPH_CACHE: dict[str, tuple[dict, float]] = {}
+_GRAPH_CACHE_TTL_S: float = 30.0
+_GRAPH_CACHE_INFLIGHT: dict[str, asyncio.Event] = {}  # stampede protection
+
+
+def _graph_cache_key(**kwargs: Any) -> str:
+    """Stable hash of the query parameters — order-independent for list values."""
+    normalized = {
+        k: sorted(v) if isinstance(v, list) else v
+        for k, v in kwargs.items()
+    }
+    raw = json.dumps(normalized, sort_keys=True, default=str).encode()
+    return hashlib.sha256(raw).hexdigest()[:20]
 
 # Structural edge types that define the container hierarchy.
 # These are NEVER returned as Cytoscape edges — instead they populate the
@@ -169,6 +197,55 @@ def _node_type(labels: list[str]) -> str:
 
 
 async def get_full_graph(
+    dimension: str | None = None,
+    overlays: list[str] | None = None,
+    strict_overlays: bool = False,
+    collapse_l3_on_physical: bool = False,
+    site: str | None = None,
+    limit: int = 2000,
+    include_interfaces: bool = False,
+    include_mac_nodes: bool = False,
+) -> dict[str, list[dict]]:
+    # ── Cache check ──────────────────────────────────────────────────────────
+    cache_key = _graph_cache_key(
+        overlays=overlays, dimension=dimension, site=site, limit=limit,
+        strict_overlays=strict_overlays, collapse_l3_on_physical=collapse_l3_on_physical,
+        include_interfaces=include_interfaces, include_mac_nodes=include_mac_nodes,
+    )
+    now = time.monotonic()
+    if cache_key in _GRAPH_CACHE:
+        cached_result, expiry = _GRAPH_CACHE[cache_key]
+        if now < expiry:
+            log.debug("graph.cache.hit", key=cache_key[:8])
+            return cached_result
+
+    # Stampede protection: if another coroutine is already computing this key,
+    # wait for it and then return from cache.
+    if cache_key in _GRAPH_CACHE_INFLIGHT:
+        evt = _GRAPH_CACHE_INFLIGHT[cache_key]
+        await evt.wait()
+        cached = _GRAPH_CACHE.get(cache_key)
+        if cached:
+            return cached[0]
+        # Fell through (computing coroutine failed) — recompute below.
+
+    inflight_evt = asyncio.Event()
+    _GRAPH_CACHE_INFLIGHT[cache_key] = inflight_evt
+    try:
+        result = await _get_full_graph_impl(
+            dimension=dimension, overlays=overlays, strict_overlays=strict_overlays,
+            collapse_l3_on_physical=collapse_l3_on_physical, site=site, limit=limit,
+            include_interfaces=include_interfaces, include_mac_nodes=include_mac_nodes,
+        )
+        _GRAPH_CACHE[cache_key] = (result, time.monotonic() + _GRAPH_CACHE_TTL_S)
+        log.debug("graph.cache.store", key=cache_key[:8], ttl_s=_GRAPH_CACHE_TTL_S)
+        return result
+    finally:
+        _GRAPH_CACHE_INFLIGHT.pop(cache_key, None)
+        inflight_evt.set()
+
+
+async def _get_full_graph_impl(  # noqa: C901 — intentionally large function
     dimension: str | None = None,
     overlays: list[str] | None = None,
     strict_overlays: bool = False,

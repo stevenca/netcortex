@@ -321,18 +321,21 @@ if _mcp_app is not None:
 # query cannot exhaust the worker pool.
 _QUERY_BUDGETS_S: dict[str, float] = {
     "/api/graph/aggregated": 5.0,
-    "/api/graph":            10.0,
-    "/api/graph/device":     10.0,
+    # First cold-cache call can take 20-30 s on a large graph; raise budget
+    # accordingly. Subsequent calls return from the 30-second in-process cache
+    # in < 1 ms, so the elevated budget only burns on genuine cold-starts.
+    "/api/graph":            45.0,
+    "/api/graph/device":     15.0,
     "/api/graph/path":       15.0,
-    "/api/graph/stp":        10.0,
-    "/api/graph/routing":    10.0,
-    "/api/graph/vlans":      10.0,
-    "/api/graph/mac-table":  10.0,
+    "/api/graph/stp":        15.0,
+    "/api/graph/routing":    15.0,
+    "/api/graph/vlans":      15.0,
+    "/api/graph/mac-table":  15.0,
     "/api/graph/stats":      5.0,
-    "/api/inventory":        10.0,
+    "/api/inventory":        15.0,
     "/api/filter-catalog":   5.0,
-    "/api/cam":              10.0,
-    "/api/links":            10.0,
+    "/api/cam":              15.0,
+    "/api/links":            15.0,
 }
 _DEFAULT_QUERY_BUDGET_S = 30.0
 
@@ -375,6 +378,22 @@ async def _query_budget(request, call_next):
 
 app.include_router(status_router)
 app.include_router(webhook_router)
+
+
+@app.post("/api/graph/cache/invalidate", tags=["graph"], status_code=200)
+async def invalidate_graph_cache() -> dict[str, int]:
+    """Clear the in-process full-graph result cache.
+
+    Call this after a large sync completes so the next topology request
+    fetches fresh data from Neo4j instead of serving the cached snapshot.
+    The cache self-expires in 30 seconds; this endpoint forces immediate
+    expiry.
+    """
+    from netcortex.graph.query import _GRAPH_CACHE
+    n = len(_GRAPH_CACHE)
+    _GRAPH_CACHE.clear()
+    log.info("api.graph_cache.invalidated", entries_cleared=n)
+    return {"cleared": n}
 
 
 # ── Prometheus-style /metrics endpoint ────────────────────────────────────────
