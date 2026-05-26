@@ -24,6 +24,37 @@ and this file MUST be updated together whenever `__version__` changes.
 
 ---
 
+## [Unreleased — 0.6.0-dev29]
+
+### Added (dev29)
+- **MCP in-server skill documentation — two-layer approach**
+  (`netcortex/mcp/server.py`, `netcortex/mcp/prompts.py`).
+
+  **Layer 1 — expanded `instructions` field** (always available at session
+  init): the MCP `initialize` response now contains a full tool-category
+  overview with one-line descriptions of every tool, argument names, return
+  shape summary, and the canonical 5-step agentic workflow. OpenClaw (and any
+  other MCP client) receives this automatically on connect without any extra
+  tool call.
+
+  **Layer 2 — `get_skill` prompt** (on-demand deep reference): a new MCP
+  prompt named `get_skill(topic)` serves structured, Markdown-formatted skill
+  documents for any of five topics:
+  - `health`    — top_problems workflow, problem_type table, staleness policy,
+                  drill-down patterns, worked example.
+  - `topology`  — topology_get / paths_find / links_list usage, edge types,
+                  flap state values, worked example.
+  - `device`    — find_device, get_device_detail, CLI/RESTCONF/NETCONF access,
+                  safety rules, worked example.
+  - `incident`  — 7-phase incident investigation workflow, triage groupings,
+                  per-symptom CLI command table, remediation proposal format.
+  - `lookup`    — ip_lookup, mac_lookup, duplicate detection, worked examples.
+  - `all`       — all five documents concatenated (for context preloading).
+
+  Skills live server-side, stay in sync with the tool surface, and require no
+  changes to OpenClaw config when the server evolves. The static
+  `skills/*/SKILL.md` files are retained as human-readable references.
+
 ## [Unreleased — 0.6.0-dev28]
 
 ### Security (dev28)
