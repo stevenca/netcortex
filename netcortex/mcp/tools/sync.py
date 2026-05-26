@@ -1,6 +1,11 @@
 """MCP tools for sync engine visibility and control."""
 
+from typing import Literal
+
 from netcortex.mcp.server import mcp
+
+DiffType = Literal["added", "removed", "changed"]
+SyncScope = Literal["devices", "interfaces", "vlans", "topology", "all"]
 
 
 @mcp.tool()
@@ -18,7 +23,7 @@ async def get_sync_status(adapter: str | None = None) -> dict:
 @mcp.tool()
 async def get_pending_diffs(
     adapter: str | None = None,
-    diff_type: str | None = None,
+    diff_type: DiffType | None = None,
 ) -> dict:
     """
     Return changes detected by the sync engine not yet reconciled with NetBox.
@@ -31,7 +36,7 @@ async def get_pending_diffs(
 
 
 @mcp.tool()
-async def trigger_sync(adapter: str, scope: str = "all") -> dict:
+async def trigger_sync(adapter: str, scope: SyncScope = "all") -> dict:
     """
     Manually trigger a sync for one adapter instance or all instances of a type.
 

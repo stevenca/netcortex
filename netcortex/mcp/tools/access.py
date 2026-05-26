@@ -1,7 +1,17 @@
 """MCP tools for direct device access: CLI, RESTCONF, NETCONF."""
 
+from typing import Literal
+
 from netcortex.mcp.server import mcp
 from netcortex.access import cli, restconf, netconf
+
+RestconfDatastore = Literal["running", "candidate", "startup"]
+RestconfMethod = Literal["PUT", "PATCH", "POST"]
+NetconfOperation = Literal["get-config", "get-state", "get"]
+NetconfSource = Literal["running", "candidate", "startup"]
+NetconfFilterType = Literal["subtree", "xpath"]
+NetconfOutputFormat = Literal["dict", "xml"]
+NetconfTarget = Literal["candidate", "running", "startup"]
 
 
 @mcp.tool()
@@ -33,7 +43,7 @@ async def run_cli_commands(
 async def get_restconf(
     device: str,
     path: str,
-    datastore: str = "running",
+    datastore: RestconfDatastore = "running",
 ) -> dict:
     """Fetch a YANG path from a device via RESTCONF GET (RFC 8040)."""
     # TODO: resolve credentials from NetBox, then call restconf.get()
@@ -45,7 +55,7 @@ async def put_restconf(
     device: str,
     path: str,
     data: dict,
-    method: str = "PUT",
+    method: RestconfMethod = "PUT",
 ) -> dict:
     """Push configuration to a device via RESTCONF PUT/PATCH/POST. Requires write scope."""
     # TODO: resolve credentials and call restconf.put()
@@ -55,11 +65,11 @@ async def put_restconf(
 @mcp.tool()
 async def get_netconf(
     device: str,
-    operation: str = "get-config",
-    source: str = "running",
-    filter_type: str | None = None,
+    operation: NetconfOperation = "get-config",
+    source: NetconfSource = "running",
+    filter_type: NetconfFilterType | None = None,
     filter_value: str | None = None,
-    output_format: str = "dict",
+    output_format: NetconfOutputFormat = "dict",
 ) -> dict:
     """Retrieve configuration or operational state from a device via NETCONF (RFC 6241)."""
     # TODO: resolve credentials and call netconf.get_config() or netconf.get_state()
@@ -70,7 +80,7 @@ async def get_netconf(
 async def netconf_edit_config(
     device: str,
     config_xml: str,
-    target: str = "candidate",
+    target: NetconfTarget = "candidate",
     commit: bool = True,
 ) -> dict:
     """Push a NETCONF edit-config RPC to a device. Requires write scope."""

@@ -24,7 +24,28 @@ and this file MUST be updated together whenever `__version__` changes.
 
 ---
 
-## [Unreleased — 0.6.0-dev29]
+## [Unreleased — 0.6.0-dev30]
+
+### Added (dev30)
+- **MCP enum hints for tool argument schemas** (`netcortex/mcp/tools/agentic_ops.py`,
+  `netcortex/mcp/tools/access.py`, `netcortex/mcp/tools/sync.py`).
+  Added `typing.Literal[...]` type hints on constrained string arguments so
+  MCP `tools/list` advertises explicit `enum` values in JSON Schema.
+
+  This improves MCP-native tool integration quality for clients/agents by
+  making valid argument choices machine-discoverable instead of buried only
+  in docstrings. Key enums now exposed include:
+  - `top_problems.severity`: `critical|warning|info`
+  - `history_get.target`: `device|link|peer|auto`
+  - `history_get.field`: `status|oper_status|stp_state`
+  - `links_list.status`: `up|down`
+  - `links_list.edge_type`: `PHYSICAL_LINK|WAN_UPLINK|SDWAN_TUNNEL|VXLAN_TUNNEL`
+  - `links_list.flap_state` / `peers_list.flap_state`: `stable|unstable|flapping`
+  - `peers_list.protocol`: `BGP|OSPF|EIGRP|ISIS`
+  - `inventory_list.snmp_health`: `full|partial|restricted|unreachable|cloud_only|unpolled`
+  - `sync.get_pending_diffs.diff_type`: `added|removed|changed`
+  - `sync.trigger_sync.scope`: `devices|interfaces|vlans|topology|all`
+  - Access-layer enums for RESTCONF/NETCONF methods/datastores/operations.
 
 ### Added (dev29)
 - **MCP in-server skill documentation — two-layer approach**

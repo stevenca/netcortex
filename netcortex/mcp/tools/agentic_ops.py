@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 
@@ -37,6 +37,24 @@ log = structlog.get_logger(__name__)
 _DEFAULT_LIMIT = 50
 _MAX_LIMIT     = 500
 _ALLOWED_HISTORY_FIELDS = frozenset({"status", "oper_status", "stp_state"})
+
+InventoryFlapState = Literal["stable", "unstable", "flapping"]
+InventorySnmpHealth = Literal[
+    "full",
+    "partial",
+    "restricted",
+    "unreachable",
+    "cloud_only",
+    "unpolled",
+]
+LinkStatus = Literal["up", "down"]
+LinkEdgeType = Literal["PHYSICAL_LINK", "WAN_UPLINK", "SDWAN_TUNNEL", "VXLAN_TUNNEL"]
+LinkFlapState = Literal["stable", "unstable", "flapping"]
+PeerFlapState = Literal["stable", "unstable", "flapping"]
+PeerProtocol = Literal["BGP", "OSPF", "EIGRP", "ISIS"]
+HistoryField = Literal["status", "oper_status", "stp_state"]
+HistoryTarget = Literal["device", "link", "peer", "auto"]
+TopProblemsSeverity = Literal["critical", "warning", "info"]
 
 
 def _clamp_limit(n: int | None) -> int:
@@ -150,8 +168,8 @@ async def inventory_list(
     site: str | None = None,
     role: str | None = None,
     status: str | None = None,
-    flap_state: str | None = None,
-    snmp_health: str | None = None,
+    flap_state: InventoryFlapState | None = None,
+    snmp_health: InventorySnmpHealth | None = None,
     limit: int = _DEFAULT_LIMIT,
 ) -> dict:
     """List devices with state, optionally filtered.
@@ -273,9 +291,9 @@ async def topology_get(
 # ─────────────────────────────────────────────────────────────────────────────
 @mcp.tool()
 async def links_list(
-    status: str | None = None,
-    edge_type: str | None = None,
-    flap_state: str | None = None,
+    status: LinkStatus | None = None,
+    edge_type: LinkEdgeType | None = None,
+    flap_state: LinkFlapState | None = None,
     min_flap_score: float = 0.0,
     min_util: float = 0.0,
     min_error_rate: float = 0.0,
@@ -416,8 +434,8 @@ async def links_list(
 @mcp.tool()
 async def peers_list(
     state: str | None = None,
-    flap_state: str | None = None,
-    protocol: str | None = None,
+    flap_state: PeerFlapState | None = None,
+    protocol: PeerProtocol | None = None,
     device: str | None = None,
     limit: int = _DEFAULT_LIMIT,
 ) -> dict:
@@ -572,8 +590,8 @@ async def paths_find(
 @mcp.tool()
 async def history_get(
     element_name: str,
-    field: str = "oper_status",
-    target: str = "auto",
+    field: HistoryField = "oper_status",
+    target: HistoryTarget = "auto",
 ) -> dict:
     """Return the connectivity history (transition list + flap stats)
     for one element.
@@ -865,7 +883,7 @@ async def ip_lookup(ip: str, limit: int = _DEFAULT_LIMIT) -> dict:
 # Maps to the entire top-20 list.  The hero tool for agentic ops.
 # ─────────────────────────────────────────────────────────────────────────────
 @mcp.tool()
-async def top_problems(limit: int = 20, severity: str | None = None) -> dict:
+async def top_problems(limit: int = 20, severity: TopProblemsSeverity | None = None) -> dict:
     """Run a battery of health checks and return a ranked list of
     issues — the single best tool to ask an agent to call first when
     asked "what's wrong with the network?".
