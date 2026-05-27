@@ -63,6 +63,13 @@ class SecretPaths:
           catalyst_center: { url, username, password }
           intersight:      { key_id, secret_key, base_url (optional) }
           nexus_dashboard: { url, username, password }
+          fmc:             { deployment_mode, domain_uuid (optional; auto-discovered by default),
+                             domain_name (optional selector for multi-domain FMC),
+                             expand_details (optional, default true),
+                             on-prem: url+username+password,
+                             cdFMC: key_id + access_token + refresh_token
+                                     (api_token supported for compatibility),
+                                     optional base_url/region/token_url }
           snmp:            { community, version, auth_key, priv_key, ip_range }
 
         Any instance may also include:

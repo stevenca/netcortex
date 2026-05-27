@@ -51,6 +51,8 @@ Multiple instances of the same type are fully supported — one secret per insta
 | `netcortex/adapters/intersight/primary` | `key_id`, `secret_key`, `base_url` (optional) |
 | `netcortex/adapters/nexus_dashboard/dc1-prod` | `url`, `username`, `password` |
 | `netcortex/adapters/nexus_dashboard/dc2-prod` | `url`, `username`, `password` |
+| `netcortex/adapters/fmc/onprem-prod` | `deployment_mode=onprem`, `url`, `username`, `password`, `domain_uuid` (optional; auto-discovered if omitted), `domain_name` (optional selector), `expand_details` (default true) |
+| `netcortex/adapters/fmc/cloud-prod` | `deployment_mode=cdfmc`, `key_id`, `access_token`, `refresh_token`, `domain_uuid` (optional; auto-discovered if omitted), `domain_name` (optional selector), `region` or `base_url`, `expand_details` (default true) |
 | `netcortex/adapters/snmp/legacy-floor2` | `community`, `version`, `ip_range`, `auth_key`, `priv_key` |
 
 ### Device Credentials
@@ -74,6 +76,8 @@ This single secret declares every adapter instance. NetCortex reads it at startu
     {"type": "intersight",       "name": "primary",      "enabled": true},
     {"type": "nexus_dashboard",  "name": "dc1-prod",     "enabled": true},
     {"type": "nexus_dashboard",  "name": "dc2-prod",     "enabled": false},
+    {"type": "fmc",              "name": "onprem-prod",  "enabled": true},
+    {"type": "fmc",              "name": "cloud-prod",   "enabled": false},
     {"type": "snmp",             "name": "legacy-floor2","enabled": true}
   ]
 }
@@ -178,7 +182,8 @@ aws secretsmanager create-secret \
       {"type": "meraki",          "name": "corp",    "enabled": true},
       {"type": "meraki",          "name": "branch",  "enabled": true},
       {"type": "catalyst_center", "name": "dc1",     "enabled": true},
-      {"type": "nexus_dashboard", "name": "dc1-prod","enabled": true}
+      {"type": "nexus_dashboard", "name": "dc1-prod","enabled": true},
+      {"type": "fmc",             "name": "onprem-prod","enabled": true}
     ]
   }'
 
@@ -201,6 +206,16 @@ aws secretsmanager create-secret \
 aws secretsmanager create-secret \
   --name netcortex/adapters/nexus_dashboard/dc1-prod \
   --secret-string '{"url": "https://nd-dc1.example.com", "username": "netcortex", "password": "..."}'
+
+# FMC on-prem
+aws secretsmanager create-secret \
+  --name netcortex/adapters/fmc/onprem-prod \
+  --secret-string '{"deployment_mode":"onprem","url":"https://fmc.example.com","username":"api-user","password":"...","verify_ssl":true}'
+
+# FMC cloud-delivered (cdFMC / Security Cloud Control)
+aws secretsmanager create-secret \
+  --name netcortex/adapters/fmc/cloud-prod \
+  --secret-string '{"deployment_mode":"cdfmc","key_id":"...","access_token":"...","refresh_token":"...","region":"us","domain_name":"Global","verify_ssl":true}'
 
 # Site-wide device creds
 aws secretsmanager create-secret \
@@ -277,7 +292,8 @@ vault kv put secret/netcortex/adapters/_index \
     {"type":"meraki","name":"corp","enabled":true},
     {"type":"meraki","name":"branch","enabled":true},
     {"type":"catalyst_center","name":"dc1","enabled":true},
-    {"type":"nexus_dashboard","name":"dc1-prod","enabled":true}
+    {"type":"nexus_dashboard","name":"dc1-prod","enabled":true},
+    {"type":"fmc","name":"onprem-prod","enabled":true}
   ]'
 
 # Meraki instances
@@ -294,6 +310,24 @@ vault kv put secret/netcortex/adapters/catalyst_center/dc1 \
 # Nexus Dashboard
 vault kv put secret/netcortex/adapters/nexus_dashboard/dc1-prod \
   url="https://nd-dc1.example.com" username="netcortex" password="..."
+
+# FMC on-prem
+vault kv put secret/netcortex/adapters/fmc/onprem-prod \
+  deployment_mode="onprem" \
+  url="https://fmc.example.com" \
+  username="api-user" \
+  password="..." \
+  verify_ssl="true"
+
+# FMC cloud-delivered (cdFMC / Security Cloud Control)
+vault kv put secret/netcortex/adapters/fmc/cloud-prod \
+  deployment_mode="cdfmc" \
+  key_id="..." \
+  access_token="..." \
+  refresh_token="..." \
+  region="us" \
+  domain_name="Global" \
+  verify_ssl="true"
 
 # Site-wide device creds
 vault kv put secret/netcortex/devices/site/building-a \

@@ -892,15 +892,29 @@ async def get_device_context(device_name: str, hops: int = 2) -> dict[str, Any]:
     """Return a device and its neighbourhood up to `hops` away."""
     driver = get_driver()
     async with driver.session() as session:
+        # Multiple Device nodes can legitimately share the same name across
+        # adapters (e.g., fmc:<id> + snmp:<id> variants). Pick the most useful
+        # anchor deterministically for detail views: prefer non-stub variants
+        # with the richest HAS_INTERFACE fan-out.
         result = await session.run(
             "MATCH (d:Device) WHERE d.name = $name "
-            "RETURN properties(d) AS props, labels(d) AS lbls LIMIT 1",
+            "OPTIONAL MATCH (d)-[:HAS_INTERFACE]->(i:Interface) "
+            "WITH d, count(i) AS if_count "
+            "RETURN properties(d) AS props, labels(d) AS lbls, if_count "
+            "ORDER BY "
+            "  CASE WHEN coalesce(d.stub, false) THEN 1 ELSE 0 END ASC, "
+            "  if_count DESC, "
+            "  coalesce(d.source_adapter, '') ASC "
+            "LIMIT 1",
             name=device_name,
         )
         rec = await result.single()
         if not rec:
             return {"error": f"Device '{device_name}' not found in graph"}
         device: dict = rec["props"] or {}
+        device_id = device.get("id")
+        if not device_id:
+            return {"error": f"Device '{device_name}' found but has no graph id"}
 
         # Neighbourhood subgraph.
         # Path-length bounds CANNOT be parameterised — Cypher requires them
@@ -909,13 +923,13 @@ async def get_device_context(device_name: str, hops: int = 2) -> dict[str, Any]:
         # data explorer can ask for a tight 1-hop neighbourhood.
         hop_n = max(1, min(int(hops or 2), 4))
         result = await session.run(
-            "MATCH path = (d:Device {name: $name})-[*1.." + str(hop_n) + "]-(n) "
+            "MATCH path = (d:Device {id: $device_id})-[*1.." + str(hop_n) + "]-(n) "
             "RETURN "
             "  [nd IN nodes(path) | {props: properties(nd), labels: labels(nd)}] AS path_nodes, "
             "  [rr IN relationships(path) | {props: properties(rr), type: type(rr), "
             "    src_id: startNode(rr).id, dst_id: endNode(rr).id, "
             "    rel_id: id(rr)}]                                                AS path_rels",
-            name=device_name,
+            device_id=device_id,
         )
         path_records = await result.data()
 

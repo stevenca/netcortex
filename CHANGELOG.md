@@ -24,7 +24,223 @@ and this file MUST be updated together whenever `__version__` changes.
 
 ---
 
-## [Unreleased — 0.6.0-dev30]
+## [Unreleased — 0.6.0-dev46]
+
+### Fixed (dev46)
+- **FMC interface metadata no longer overwrites graph node identity**
+  (`netcortex/adapters/fmc.py`).
+
+  Detailed cdFMC interface payloads include their own `id` field. During node
+  merge this could overwrite the canonical graph node `id` property, causing
+  `HAS_INTERFACE` relationships to miss their targets and making device detail
+  views appear to have no interfaces. Adapter metadata sanitization now drops
+  reserved graph identity keys (`id`, `source`, `target`) before persistence.
+
+### Fixed (dev45)
+- **Device detail context now anchors by best matching device variant (not
+  arbitrary name match)** (`netcortex/graph/query.py`).
+
+  In environments where multiple `Device` nodes share the same `name` across
+  adapters, `/api/graph/device/{name}` previously used `LIMIT 1` and could
+  select a sparse/stub variant with no interfaces. The detail panel now:
+  - selects a deterministic anchor (non-stub first, then highest interface
+    count),
+  - expands neighbourhood from that device's `id` (not name),
+  ensuring interface/neighbour sections reflect the rich adapter variant.
+
+### Changed (dev44)
+- **FMC adapter now expands `links.self` detail objects for richer inventory**
+  (`netcortex/adapters/fmc.py`, `docs/secrets.md`,
+  `netcortex/secrets/base.py`).
+
+  cdFMC list endpoints often return sparse summary rows (`id`, `name`, `type`,
+  `links`) with minimal metadata. The adapter now follows each object's
+  `links.self` URL (device + interface rows) and uses the detailed payload for
+  normalization. This surfaces richer fields (for example model, health,
+  deployment state, interface mode/MTU/hardware/IP) in NetCortex.
+
+  New optional `expand_details` secret key (default `true`) controls this
+  behavior.
+
+### Fixed (dev43)
+- **FMC ingest now sanitizes nested API metadata to Neo4j-safe property types**
+  (`netcortex/adapters/fmc.py`).
+
+  cdFMC interface/object payloads include nested structures (for example
+  `links.self`) that Neo4j rejects as map-valued properties. The adapter now
+  coerces metadata values to primitives/primitive arrays, serializing nested
+  maps/lists to compact JSON strings. This prevents ingest failures and allows
+  FMC inventory to persist in graph storage.
+
+### Fixed (dev42)
+- **cdFMC auth no longer requires `/info/domain` when `domain_uuid` is set**
+  (`netcortex/adapters/fmc.py`).
+
+  For restricted cdFMC roles/tenants where `/info/domain` can return HTTP 400,
+  the adapter now skips domain-info lookup when `domain_uuid` is already known.
+  This keeps `fmc/<instance>` healthy/loadable while preserving auto-discovery
+  behavior when `domain_uuid` is omitted.
+
+### Changed (dev41)
+- **`fmc` now supports `domain_name` selection for multi-domain environments**
+  (`netcortex/adapters/fmc.py`, `docs/secrets.md`,
+  `netcortex/secrets/base.py`).
+
+  Domain resolution precedence is now:
+  1. `domain_uuid` if explicitly configured
+  2. `domain_name` exact match from `/info/domain`
+  3. first discovered domain UUID (existing fallback)
+
+  This keeps default auto-discovery behavior while allowing deterministic
+  domain targeting without requiring operators to manually pre-resolve UUIDs.
+
+### Changed (dev40)
+- **`fmc` now defaults `domain_uuid` via API auto-discovery when omitted**
+  (`netcortex/adapters/fmc.py`, `docs/secrets.md`,
+  `netcortex/secrets/base.py`).
+
+  Behavior for both on-prem FMC and cdFMC:
+  - If `domain_uuid` is provided in secret, it is used.
+  - If omitted, adapter calls platform domain-info API and selects the first
+    available domain UUID (`uuid` or `id` field supported).
+
+  This makes `domain_uuid` optional by default for common single-domain setups.
+
+### Changed (dev39)
+- **cdFMC auth now matches issued credential tuple (`key_id`, `access_token`,
+  `refresh_token`) with automatic access-token refresh**
+  (`netcortex/adapters/fmc.py`, `docs/secrets.md`,
+  `netcortex/secrets/base.py`).
+
+  The `fmc` adapter in `deployment_mode: "cdfmc"` now accepts the same values
+  operators receive from token issuance:
+  - `key_id`
+  - `access_token`
+  - `refresh_token`
+
+  Runtime behavior:
+  - uses `access_token` for bearer auth,
+  - refreshes on 401 automatically using `refresh_token` (plus `key_id`),
+  - performs proactive refresh when JWT `exp` is near expiry (when decodable),
+  - keeps backward compatibility with legacy `api_token` field as alias.
+
+### Added (dev38)
+- **New `fmc` adapter with dual-mode transport for on-prem FMC and cdFMC**
+  (`netcortex/adapters/fmc.py`, `pyproject.toml`,
+  `netcortex/secrets/base.py`).
+
+  The adapter supports both deployment variants with one normalized graph path:
+  - `deployment_mode: "onprem"` — token auth via FMC
+    `/api/fmc_platform/v1/auth/generatetoken`.
+  - `deployment_mode: "cdfmc"` — bearer token auth to Security Cloud Control
+    firewall API (`/v1/cdfmc/...`).
+
+  Initial ingestion scope (MVP):
+  - Device inventory (`Device` nodes, FMC-derived status normalization)
+  - Interface inventory (`Interface` nodes, `HAS_INTERFACE`)
+  - Interface IP assignments (`IPAddress` nodes, `ASSIGNED_IP`)
+  - Domain container mapping (`PlatformSite` + `LOCATED_AT`)
+  - VLAN object discovery where exposed (`VLAN` nodes)
+
+  This enables FMC-managed assets to appear immediately in existing
+  NetCortex inventory/topology/MCP surfaces while leaving richer policy/event
+  ingestion for follow-on phases.
+
+### Changed (dev37)
+- **MX WAN telemetry gaps now map to health unknown (not critical)**
+  (`netcortex/graph/correlate.py`, `netcortex/status/templates/index.html`).
+
+  For `WAN_UPLINK` edges discovered via MX logic, when `oper_status` is up but
+  SNMP telemetry is unavailable (`snmp_health=unreachable`) or limited
+  (`cloud_only`/`stale`), NetCortex now:
+  - keeps `oper_status` as up,
+  - sets `health_status='unknown'`,
+  - uses neutral/non-punitive scoring (`health_score=0`) so line color follows
+    up-state green instead of forcing red.
+
+  Tooltip health badge now renders `HEALTH UNKNOWN` and shows explicit reason
+  text so operators can distinguish telemetry uncertainty from actual failure.
+
+### Changed (dev36)
+- **WAN tooltip now shows explicit health reason for MX uplinks**
+  (`netcortex/graph/correlate.py`, `netcortex/status/templates/index.html`).
+
+  MX WAN enrichment now stamps `WAN_UPLINK.health_reason` based on the scoring
+  rule, and edge hover renders that reason under the health badge. This makes
+  cases like `oper_status=up` but `health_score=70` self-explanatory (for
+  example, "Uplink is up but SNMP health is unreachable").
+
+### Fixed (dev35)
+- **Topology chip-filter expansion restored while keeping 3+ chip support**
+  (`netcortex/status/templates/index.html`).
+
+  The prior width fix removed the apparent two-chip cap but over-constrained the
+  control width in some layouts. Topology chip-filter now uses responsive
+  expansion (`expandable=true`) with full-width growth and wrapping, so adding
+  more chips still works and the control expands naturally in the toolbar.
+
+### Fixed (dev34)
+- **Topology chip-filter layout no longer visually clamps around two chips**
+  (`netcortex/status/templates/index.html`).
+
+  The toolbar chip-filter wrapper was constrained to a tight width and could
+  make additional chips appear non-addable in some viewport/layout states.
+  Updated the chip-filter host to a wider, true multi-line flex layout so
+  third+ site/device chips remain visible and usable.
+
+### Fixed (dev33)
+- **Topology chip filter Enter-key selection no longer appears capped**
+  (`netcortex/status/templates/index.html`).
+
+  The chip filter previously committed with Enter only when exactly one
+  suggestion remained. For broad prefixes (for example `cpn-`) this produced
+  multiple matches, so pressing Enter did nothing and could look like a hard
+  limit after two chips were already selected.
+
+  Enter now commits the first suggestion whenever any suggestions are present.
+
+### Changed (dev32)
+- **WAN eBGP overlay now renders concrete external-peer routers (IP + ASN)**
+  and richer WAN hover diagnostics
+  (`netcortex/graph/correlate.py`, `netcortex/status/templates/index.html`).
+
+  For eBGP WAN boundaries, the correlator now creates `ExternalRouter` nodes
+  (labeled with peer IP + ASN) and models:
+  - `Device -> ExternalRouter` as `WAN_UPLINK (via='ebgp')`
+  - `ExternalRouter -> Internet` as `TRANSITS`
+
+  This replaces the previous abstract `Device -> AutonomousSystem` depiction for
+  eBGP edges, so the visual reflects the actual peer endpoint while retaining
+  ASN context.
+
+  WAN edge mouseover now includes all key line-label facts (mode, ASN, peer IP,
+  egress interface, slot/public/private IP, upstream router) and adds a 7-day
+  utilization trend sparkline directly in the tooltip.
+
+### Changed (dev31)
+- **WAN topology inference now prefers in-network upstream routers for MX edges**
+  (`netcortex/graph/correlate.py`, `netcortex/status/templates/index.html`).
+
+  Previously every MX with `wan{1,2}_public_ip` was modeled as a direct
+  `Device -> Internet` `WAN_UPLINK`, which could be misleading in designs where
+  MX appliances uplink to an internal router/firewall first.
+
+  The correlator now:
+  - Builds a candidate set of external-eBGP border devices.
+  - For each MX WAN slot, attempts to find the nearest upstream border device
+    through correlated `PHYSICAL_LINK` paths (up to 6 hops), preferring same-site.
+  - Emits `WAN_UPLINK` edges as `MX -> upstream Device` (`via='mx_upstream'`)
+    when a path is found.
+  - Falls back to `MX -> Internet` (`via='mx_uplink'`) only when no upstream
+    candidate is discoverable.
+
+  ASN indicators are now naturally anchored at the border-router eBGP boundary
+  (`Device -> AutonomousSystem`) rather than implying every MX is directly
+  peering to the upstream ASN.
+
+  Also hardened home-AS detection to prefer `ROUTING_PEER.local_as` evidence
+  before `remote_as` heuristics, reducing misclassification of the operator's
+  own ASN as an external/transit ASN.
 
 ### Added (dev30)
 - **MCP enum hints for tool argument schemas** (`netcortex/mcp/tools/agentic_ops.py`,

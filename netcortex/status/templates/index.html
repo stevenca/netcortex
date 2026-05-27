@@ -410,7 +410,7 @@
   <div class="flex-1"></div>
 
   <!-- Multi-select chip filter: scope by site(s) and/or device(s). -->
-  <div id="topology-chip-filter" title="Limit the canvas to specific sites and/or devices"></div>
+  <div id="topology-chip-filter" class="flex-1 min-w-[280px] max-w-full" title="Limit the canvas to specific sites and/or devices"></div>
 
   <!-- Search -->
   <input id="search-input"
@@ -846,6 +846,7 @@ const TYPE_COLORS = {
   RoutingPeer:  '#4ade80',   // soft green for external routing peers
   // WAN overlay
   Internet:         '#0ea5e9',   // bright sky-blue cloud
+  ExternalRouter:   '#22c55e',   // external peer router (IP+ASN)
   AutonomousSystem: '#22d3ee',   // cyan for upstream AS
   Default:      '#6b7280',
 };
@@ -979,7 +980,7 @@ const OVERLAY_TOOLTIP = {
   sdwan:    'Show/hide SD-WAN overlay tunnels and policy edges.',
   fabric:   'Show/hide EVPN/VXLAN fabric (VNIs, VTEP peering).',
   virtual:  'Show/hide hypervisor + VM topology.',
-  wan:      'Show/hide WAN topology: each site\'s Internet uplink (MX public IP, eBGP-to-public-AS adjacencies) and the upstream Autonomous Systems they transit.',
+  wan:      'Show/hide WAN topology: MX/edge devices to inferred upstream routers, then border-router eBGP adjacencies to external peer routers (IP+ASN) and Internet transit.',
 };
 // Ordered list of all overlay names — used to send the full union as
 // the initial fetch payload. Order matches OVERLAY_LABEL above.
@@ -1009,6 +1010,7 @@ const NODE_OVERLAY = {
   SDWANTunnel:      'sdwan',
   SDWANPolicy:      'sdwan',
   Internet:         'wan',
+  ExternalRouter:   'wan',
   AutonomousSystem: 'wan',
 };
 const EDGE_OVERLAY = {
@@ -1112,6 +1114,7 @@ function createChipFilter(opts) {
   const kinds       = new Set(opts.kinds || ['site', 'device']);
   const onChange    = opts.onChange || (() => {});
   const maxResults  = opts.maxResults || 12;
+  const expandable  = !!opts.expandable;
 
   // Restore persisted selection.  We don't validate against the
   // catalog yet because the catalog may still be loading — instead
@@ -1124,10 +1127,16 @@ function createChipFilter(opts) {
 
   // Build DOM scaffolding.  The chip bar wraps to multiple lines when
   // the operator picks a lot of items.
+  const wrapClass = expandable
+    ? 'chipfilter-wrap relative flex items-center flex-wrap gap-1 min-w-[280px] w-full max-w-full bg-gray-800 border border-gray-700 rounded px-2 py-1 focus-within:border-blue-500'
+    : 'chipfilter-wrap relative flex items-center flex-wrap gap-1 min-w-[280px] max-w-[600px] bg-gray-800 border border-gray-700 rounded px-2 py-1 focus-within:border-blue-500';
+  const inputClass = expandable
+    ? 'chipfilter-input flex-[1_0_180px] min-w-[160px] bg-transparent text-xs text-gray-200 placeholder-gray-500 focus:outline-none py-0.5'
+    : 'chipfilter-input flex-1 min-w-[140px] bg-transparent text-xs text-gray-200 placeholder-gray-500 focus:outline-none py-0.5';
   container.innerHTML = `
-    <div class="chipfilter-wrap relative inline-flex items-center flex-wrap gap-1 min-w-[280px] max-w-[600px] bg-gray-800 border border-gray-700 rounded px-2 py-1 focus-within:border-blue-500">
-      <div class="chipfilter-chips inline-flex flex-wrap gap-1"></div>
-      <input type="text" class="chipfilter-input flex-1 min-w-[140px] bg-transparent text-xs text-gray-200 placeholder-gray-500 focus:outline-none py-0.5"
+    <div class="${wrapClass}">
+      <div class="chipfilter-chips flex flex-wrap gap-1 min-w-0"></div>
+      <input type="text" class="${inputClass}"
              placeholder="${_chipEsc(placeholder)}" autocomplete="off" spellcheck="false" />
       <div class="chipfilter-dropdown hidden absolute left-0 top-full mt-1 z-50 w-full max-h-72 overflow-auto bg-gray-900 border border-gray-700 rounded-md shadow-xl text-xs"></div>
     </div>
@@ -1279,7 +1288,10 @@ function createChipFilter(opts) {
     } else if (e.key === 'Enter') {
       e.preventDefault();
       if (activeIdx >= 0) commitSelection(activeIdx);
-      else if (lastSuggestions.length === 1) commitSelection(0);
+      // UX fix: Enter should commit a suggestion whenever any are shown.
+      // Requiring "exactly one" felt like a hard chip limit when broad
+      // queries (e.g. "cpn-") produced many matches.
+      else if (lastSuggestions.length >= 1) commitSelection(0);
     } else if (e.key === 'Escape') {
       hideDropdown();
       inputEl.blur();
@@ -2842,6 +2854,36 @@ function initCy(elements) {
           'text-halign':        'center',
         }
       },
+      // External peer router — concrete upstream endpoint discovered from BGP.
+      // Labeled as "<peer_ip> · AS<asn>" so the operator sees the exact
+      // handoff target, not just an abstract ASN bubble.
+      {
+        selector: 'node[type="ExternalRouter"]',
+        style: {
+          'background-color':   '#22c55e',
+          'background-opacity': 0.20,
+          'border-color':       '#22c55e',
+          'border-width':       2,
+          'shape':              'diamond',
+          'width':              56,
+          'height':             56,
+          'label':              (ele) => {
+            const ip = ele.data('peer_ip') || '';
+            const asn = ele.data('asn');
+            if (ip && asn != null) return `${ip}\nAS${asn}`;
+            if (ip) return ip;
+            if (asn != null) return `AS${asn}`;
+            return ele.data('name') || 'peer';
+          },
+          'color':              '#bbf7d0',
+          'font-size':          9,
+          'font-weight':        'bold',
+          'text-wrap':          'wrap',
+          'text-max-width':     110,
+          'text-valign':        'center',
+          'text-halign':        'center',
+        }
+      },
       // Autonomous System — a known upstream ISP / cloud / corp AS.
       // Hexagon to evoke a routing landmark.  External ASes use cyan,
       // the home AS uses a deeper teal + bigger footprint + "(home)"
@@ -3065,7 +3107,7 @@ function initCy(elements) {
           'text-rotation': 'autorotate',
         }
       },
-      // ── WAN_UPLINK — Device → AutonomousSystem / Internet ────────────
+      // ── WAN_UPLINK — Device → ExternalRouter / Internet ──────────────
       // Color the line by the same vocabulary PHYSICAL_LINK uses:
       // green=healthy, amber=warning, red=bad, slate=unknown.  For
       // eBGP uplinks the health comes from the egress interface
@@ -3133,11 +3175,15 @@ function initCy(elements) {
             // Status badge: "(up)" / "(down)" / "(unknown)" — short,
             // mirrors the line style so the label confirms the color.
             const statusTag = oper ? `(${oper})` : '';
-            if (via === 'mx_uplink') {
+            if (via === 'mx_uplink' || via === 'mx_upstream') {
               const parts = [];
               if (slot) parts.push(slot.toUpperCase());
               if (statusTag) parts.push(statusTag);
               if (pub)  parts.push(pub);
+              if (via === 'mx_upstream') {
+                const up = ele.data('upstream_device_name') || ele.target().data('name');
+                if (up) parts.push('via ' + up);
+              }
               return parts.join(' · ');
             }
             if (via === 'ebgp') {
@@ -3662,9 +3708,21 @@ function initCy(elements) {
     // Phase D health summary at the top of the tooltip
     if (d.health_score != null) {
       const score = d.health_score;
-      const tag = score >= 60 ? 'CRITICAL' : (score >= 30 ? 'WARNING' : 'HEALTHY');
-      const color = score >= 60 ? '#ef4444' : (score >= 30 ? '#f59e0b' : '#22c55e');
-      html += `<div class="text-xs mb-1" style="color:${color}">● ${tag} (score ${score})${d.single_sided ? ' • single-sided' : ''}</div>`;
+      const hs = String(d.health_status || '').toLowerCase();
+      let tag;
+      let color;
+      if (hs === 'unknown') {
+        tag = 'HEALTH UNKNOWN';
+        color = '#94a3b8';
+      } else {
+        tag = score >= 60 ? 'CRITICAL' : (score >= 30 ? 'WARNING' : 'HEALTHY');
+        color = score >= 60 ? '#ef4444' : (score >= 30 ? '#f59e0b' : '#22c55e');
+      }
+      const scorePart = hs === 'unknown' ? '' : ` (score ${score})`;
+      html += `<div class="text-xs mb-1" style="color:${color}">● ${tag}${scorePart}${d.single_sided ? ' • single-sided' : ''}</div>`;
+      if (d.health_reason) {
+        html += `<div class="text-xs mb-1 text-gray-300"><span class="text-gray-500">Reason:</span> ${_chipEsc(d.health_reason)}</div>`;
+      }
     }
     // Per-link operational status (eBGP/MX WAN_UPLINKs carry this
     // explicitly; PHYSICAL_LINKs that derive it via interface health
@@ -3749,6 +3807,30 @@ function initCy(elements) {
         html += `<div class="flex gap-2"><span class="text-gray-400 shrink-0">Method:</span><span class="truncate">${method}</span></div>`;
       }
     } else {
+      if (type === 'WAN_UPLINK') {
+        const via = d.via || null;
+        const asn = d.asn != null ? `AS${d.asn}` : null;
+        const peer = d.peer_ip || null;
+        const iface = d.egress_iface || null;
+        const slot = d.wan_slot ? String(d.wan_slot).toUpperCase() : null;
+        const pub = d.public_ip || null;
+        const priv = d.private_ip || null;
+        const upRouter = d.upstream_device_name || null;
+        const wanRows = [
+          ['Mode', via],
+          ['ASN', asn],
+          ['Peer IP', peer],
+          ['Egress interface', iface],
+          ['WAN slot', slot],
+          ['Public IP', pub],
+          ['Private IP', priv],
+          ['Upstream router', upRouter],
+        ];
+        wanRows.forEach(([lbl, val]) => {
+          if (val != null && val !== '')
+            html += `<div class="flex gap-2"><span class="text-gray-400 shrink-0">${lbl}:</span><span class="truncate">${val}</span></div>`;
+        });
+      }
       const fields = [
         ['Endpoints', `${srcDev} ⇄ ${tgtDev}`],
         [`${srcDev}`, ifaceALabel],
@@ -3767,6 +3849,22 @@ function initCy(elements) {
         if (val != null && val !== '')
           html += `<div class="flex gap-2"><span class="text-gray-400 shrink-0">${lbl}:</span><span class="truncate">${val}</span></div>`;
       });
+
+      const utilHist = d.util_in_pct_history_7d || d.util_out_pct_history_7d || d.util_pct_history_7d;
+      const utilTrend = createMetricTrendStrip(utilHist, {
+        width: 220,
+        height: 18,
+        windowMs: 7 * 24 * 3600 * 1000,
+        color: '#60a5fa',
+        kind: 'util',
+        thresholds: [
+          { value: 70, color: 'rgba(245,158,11,0.5)', dash: '2,2', label: 'warn' },
+          { value: 90, color: 'rgba(239,68,68,0.5)', dash: '2,2', label: 'crit' },
+        ],
+      });
+      if (utilTrend) {
+        html += `<div class="mt-1"><div class="text-xs text-gray-400 mb-0.5">Utilization trend (7d)</div>${utilTrend}</div>`;
+      }
     }
     // L2 trunk / VLAN context (dev16). Surfaced per side so an operator
     // can immediately spot when one end reports an access VLAN while
@@ -4052,6 +4150,12 @@ function initCy(elements) {
     } else if (ntype === 'VLAN' || nd.vid) {
       if (nd.vid)          html += `<div class="text-xs"><span class="text-gray-400">VLAN ID:</span> ${nd.vid}</div>`;
       if (nd.fabric_name)  html += `<div class="text-xs"><span class="text-gray-400">Fabric:</span> ${nd.fabric_name}</div>`;
+    } else if (ntype === 'ExternalRouter' || nd.peer_ip || nd.asn) {
+      if (nd.peer_ip)      html += `<div class="text-xs"><span class="text-gray-400">Peer IP:</span> ${nd.peer_ip}</div>`;
+      if (nd.asn != null)  html += `<div class="text-xs"><span class="text-gray-400">ASN:</span> AS${nd.asn}</div>`;
+      if (nd.router_id)    html += `<div class="text-xs"><span class="text-gray-400">Router-ID:</span> ${nd.router_id}</div>`;
+      if (nd.role)         html += `<div class="text-xs"><span class="text-gray-400">Role:</span> ${nd.role}</div>`;
+      if (nd.source_adapter) html += `<div class="text-xs"><span class="text-gray-400">Source:</span> ${nd.source_adapter}</div>`;
     } else if (ntype === 'Prefix' || nd.cidr) {
       if (nd.cidr)         html += `<div class="text-xs"><span class="text-gray-400">CIDR:</span> ${nd.cidr}</div>`;
     } else if (ntype === 'MACAddress' || nd.mac) {
@@ -5805,6 +5909,7 @@ function initChipFilters() {
       container: topoEl,
       storageKey: 'topology',
       placeholder: 'Site or device…',
+      expandable: true,
       onChange: (sel) => applyTopologyChipFilter(sel),
     });
     // Persisted selection is automatically re-applied by initCy() /

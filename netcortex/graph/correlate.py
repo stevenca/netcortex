@@ -2222,9 +2222,12 @@ async def _detect_home_asn() -> int | None:
 
     Heuristic, ordered by signal strength:
 
-      1.  Public ASNs only — private ranges (RFC 6996) can't be a home
+      1.  Prefer ``local_as`` evidence from ROUTING_PEER relationships.
+          ``local_as`` is "our side of the session", so when present it is
+          the strongest signal for the home ASN.
+      2.  Public ASNs only — private ranges (RFC 6996) can't be a home
           AS for the public Internet.
-      2.  Score each candidate AS by:
+      3.  Score each candidate AS by:
               * distinct devices that peer to it
               * distinct sites those devices live in
               * total BGP peer endpoints to that AS
@@ -2232,14 +2235,73 @@ async def _detect_home_asn() -> int | None:
           provider almost always peers from exactly one border device
           at one site, while an iBGP home AS peers from every router
           at every site.
-      3.  Require the winner to satisfy at least one of:
+      4.  Require the winner to satisfy at least one of:
               * peers from ≥2 sites, OR
               * peers from ≥3 devices
           to avoid mis-flagging a single-site stub deployment.
-      4.  Return the winner's ASN; otherwise None (treat everything as
+      5.  Return the winner's ASN; otherwise None (treat everything as
           eBGP, same as today).
     """
     driver = get_driver()
+    async with driver.session() as session:
+        # Strongest signal: local_as values from device-side ROUTING_PEER rows.
+        local_rows = await (await session.run(
+            """
+            MATCH (x)-[r:ROUTING_PEER]-(y)
+            WITH CASE WHEN x:Device THEN x ELSE y END AS d, r
+            WHERE d:Device
+              AND r.local_as IS NOT NULL
+              AND d.tombstoned IS NULL
+            RETURN r.local_as AS asn,
+                   count(DISTINCT d) AS dev_count,
+                   count(DISTINCT d.netbox_site_slug) AS site_count,
+                   count(r) AS peer_count
+            """
+        )).data()
+
+    def _pick_best(rows: list[dict]) -> int | None:
+        best_asn: int | None = None
+        best_score = (0, 0, 0)
+        for row in rows:
+            try:
+                asn = int(row["asn"])
+            except (TypeError, ValueError):
+                continue
+            if not _is_public_asn(asn):
+                continue
+            score = (row["site_count"] or 0,
+                     row["dev_count"]  or 0,
+                     row["peer_count"] or 0)
+            if score > best_score:
+                best_score = score
+                best_asn = asn
+        site_count, dev_count, _ = best_score
+        if site_count >= 2 or dev_count >= 3:
+            return best_asn
+        return None
+
+    # For local_as evidence, a single valid observation is already strong:
+    # local_as is "our side" of the BGP session. Pick the dominant public
+    # local_as even if we only have one border device reporting BGP.
+    if local_rows:
+        best_local = None
+        best_local_score = (-1, -1, -1)
+        for row in local_rows:
+            try:
+                asn = int(row["asn"])
+            except (TypeError, ValueError):
+                continue
+            if not _is_public_asn(asn):
+                continue
+            score = (row.get("peer_count") or 0,
+                     row.get("dev_count") or 0,
+                     row.get("site_count") or 0)
+            if score > best_local_score:
+                best_local = asn
+                best_local_score = score
+        if best_local is not None:
+            return best_local
+
     async with driver.session() as session:
         rows = await (await session.run(
             """
@@ -2252,27 +2314,7 @@ async def _detect_home_asn() -> int | None:
                    count(r) AS peer_count
             """
         )).data()
-
-    best_asn: int | None = None
-    best_score = (0, 0, 0)
-    for row in rows:
-        try:
-            asn = int(row["asn"])
-        except (TypeError, ValueError):
-            continue
-        if not _is_public_asn(asn):
-            continue
-        score = (row["site_count"] or 0,
-                 row["dev_count"]  or 0,
-                 row["peer_count"] or 0)
-        if score > best_score:
-            best_score = score
-            best_asn = asn
-
-    site_count, dev_count, _ = best_score
-    if site_count >= 2 or dev_count >= 3:
-        return best_asn
-    return None
+    return _pick_best(rows)
 
 
 async def _infer_wan_topology() -> int:
@@ -2285,24 +2327,21 @@ async def _infer_wan_topology() -> int:
          iBGP — they do not count as Internet uplinks.
 
       1. **Meraki MX uplinks**: every Device with ``wan{1,2}_public_ip``
-         populated emits a direct Device → Internet WAN_UPLINK
-         tagged with the slot, public IP, and (when present) private
-         IP.  These devices uplink through whatever ISP NATs them; we
-         don't yet do reverse IP→ASN lookups so they bypass the AS
-         layer.
+         tries to resolve an upstream in-network router first using
+         correlated physical topology (LLDP/CDP and MAC-seam derived
+         PHYSICAL_LINK paths). When found, emit:
+             * MX Device → upstream Device WAN_UPLINK (via='mx_upstream')
+         If no upstream candidate is found, fall back to:
+             * MX Device → Internet WAN_UPLINK (via='mx_uplink')
 
       2. **eBGP-to-external-AS**: a Device with an established
          ROUTING_PEER edge whose ``remote_as`` is public *and* not the
          home AS emits:
-             * Device → AutonomousSystem(as:<asn>) WAN_UPLINK
-             * AutonomousSystem → Internet TRANSITS edge
+            * Device → ExternalRouter(peer_ip, asn) WAN_UPLINK
+            * ExternalRouter → Internet TRANSITS edge
 
-         The WAN_UPLINK edge IS the AS boundary marker — earlier
-         iterations also materialized a separate home-AS hexagon and
-         AS_PEER edge, but the home-AS node and its AS_PEER
-         relationships were visually redundant on top of the
-         per-device ``local_asn`` halo.  Dev3 dropped them; the AS
-         boundary is now read straight off the eBGP WAN_UPLINK lines.
+         This keeps ASN context while depicting the external side as a
+         concrete peer router (IP + ASN), not an abstract AS-only node.
 
     Every Device that participates in at least one rule is stamped
     ``is_wan_edge=true``.  Devices that have BGP evidence (iBGP or
@@ -2408,33 +2447,170 @@ async def _infer_wan_topology() -> int:
                 home_id=f"as:{home_asn}",
             )
 
-        # ── Rule 1: Meraki MX uplinks.  One MERGE per slot so dual-WAN
-        # devices show both edges and properties stay slot-isolated.
+        # ── Gather eBGP-capable border candidates first.  Rule 1 (MX upstream
+        # inference) uses these as potential upstream routers.
+        ebgp_candidate_rows = await (await session.run(
+            """
+            MATCH (x)-[r:ROUTING_PEER]-(y)
+            WITH CASE WHEN x:Device THEN x ELSE y END AS d, r
+            WHERE d:Device
+              AND d.tombstoned IS NULL
+              AND r.remote_as IS NOT NULL
+            RETURN d.id AS dev_id, r.remote_as AS asn
+            """
+        )).data()
+        ebgp_candidate_ids: set[str] = set()
+        for row in ebgp_candidate_rows:
+            try:
+                asn = int(row["asn"])
+            except (TypeError, ValueError):
+                continue
+            if not _is_public_asn(asn):
+                continue
+            if home_asn is not None and asn == home_asn:
+                continue
+            dev_id = row.get("dev_id")
+            if dev_id:
+                ebgp_candidate_ids.add(dev_id)
+
+        # Additional upstream candidates from physical topology: in-network
+        # routers/firewalls that are not Meraki MX appliances.
+        infra_router_rows = await (await session.run(
+            """
+            MATCH (d:Device)
+            WHERE d.tombstoned IS NULL
+              AND toLower(coalesce(d.platform, '')) <> 'meraki'
+              AND (
+                    toLower(coalesce(d.role, '')) IN ['router', 'firewall']
+                    OR toLower(coalesce(d.name, '')) CONTAINS 'cat8k'
+                    OR toLower(coalesce(d.platform, '')) CONTAINS 'c8'
+                  )
+            RETURN DISTINCT d.id AS dev_id
+            """
+        )).data()
+        infra_router_candidate_ids = {
+            row["dev_id"] for row in infra_router_rows if row.get("dev_id")
+        }
+
+        # ── Rule 1: Meraki MX uplinks. One MERGE per slot so dual-WAN devices
+        # show both edges and properties stay slot-isolated.
         for slot, ip_prop in (("wan1", "wan1_public_ip"),
                               ("wan2", "wan2_public_ip")):
-            res = await session.run(
+            mx_rows = await (await session.run(
                 f"""
                 MATCH (d:Device)
                 WHERE d.{ip_prop} IS NOT NULL
                   AND d.{ip_prop} <> ''
                   AND d.tombstoned IS NULL
-                MATCH (i:Internet {{id: 'internet:0'}})
-                MERGE (d)-[r:WAN_UPLINK {{
-                    source: 'correlator',
-                    via: 'mx_uplink',
-                    wan_slot: '{slot}'
-                }}]->(i)
-                SET r.public_ip   = d.{ip_prop},
-                    r.private_ip  = coalesce(d.{slot}_ip, ''),
-                    r.dimension   = 'wan',
-                    r.updated_at  = timestamp()
-                SET d.is_wan_edge      = true,
-                    d.wan_edge_reason  = 'mx_uplink'
-                RETURN count(r) AS n
+                RETURN d.id AS dev_id,
+                       d.name AS dev_name,
+                       coalesce(d.netbox_site_slug, '') AS site_slug,
+                       d.{ip_prop} AS public_ip,
+                       coalesce(d.{slot}_ip, '') AS private_ip
                 """
-            )
-            rec = await res.single()
-            created += rec["n"] if rec else 0
+            )).data()
+
+            for mx in mx_rows:
+                upstream = None
+                candidate_groups = [
+                    [cid for cid in ebgp_candidate_ids],
+                    [cid for cid in infra_router_candidate_ids],
+                ]
+                for candidates in candidate_groups:
+                    if upstream:
+                        break
+                    if not candidates:
+                        continue
+                    # Prefer same-site candidates, then global fallback.
+                    for site_scoped in (True, False):
+                        if not candidates:
+                            continue
+                        upstream_rows = await (await session.run(
+                            """
+                            MATCH (mx:Device {id: $mx_id})
+                            MATCH (up:Device)
+                            WHERE up.id IN $candidate_ids
+                              AND up.id <> mx.id
+                              AND up.tombstoned IS NULL
+                              AND (
+                                    $site_scoped = false
+                                    OR $site_slug = ''
+                                    OR up.netbox_site_slug = $site_slug
+                                  )
+                            MATCH p = shortestPath((mx)-[:PHYSICAL_LINK*1..6]-(up))
+                            RETURN up.id AS up_id,
+                                   up.name AS up_name,
+                                   length(p) AS hops
+                            ORDER BY hops ASC, up_name ASC
+                            LIMIT 1
+                            """,
+                            mx_id=mx["dev_id"],
+                            candidate_ids=candidates,
+                            site_scoped=site_scoped,
+                            site_slug=mx["site_slug"],
+                        )).data()
+                        if upstream_rows:
+                            upstream = upstream_rows[0]
+                            break
+
+                if upstream:
+                    res = await session.run(
+                        """
+                        MATCH (mx:Device {id: $mx_id})
+                        MATCH (up:Device {id: $up_id})
+                        MERGE (mx)-[r:WAN_UPLINK {
+                            source: 'correlator',
+                            via: 'mx_upstream',
+                            wan_slot: $slot
+                        }]->(up)
+                        SET r.public_ip   = $public_ip,
+                            r.private_ip  = $private_ip,
+                            r.upstream_device_id = $up_id,
+                            r.upstream_device_name = $up_name,
+                            r.dimension   = 'wan',
+                            r.updated_at  = timestamp()
+                        SET mx.is_wan_edge      = true,
+                            mx.wan_edge_reason  = 'mx_upstream',
+                            up.is_wan_edge      = true,
+                            up.wan_edge_reason  = coalesce(up.wan_edge_reason, 'mx_upstream')
+                        RETURN count(r) AS n
+                        """,
+                        mx_id=mx["dev_id"],
+                        up_id=upstream["up_id"],
+                        up_name=upstream["up_name"],
+                        slot=slot,
+                        public_ip=mx["public_ip"],
+                        private_ip=mx["private_ip"],
+                    )
+                    rec = await res.single()
+                    created += rec["n"] if rec else 0
+                else:
+                    # Fallback for sites where we still cannot resolve a
+                    # physical upstream path to an eBGP-capable border device.
+                    res = await session.run(
+                        """
+                        MATCH (d:Device {id: $dev_id})
+                        MATCH (i:Internet {id: 'internet:0'})
+                        MERGE (d)-[r:WAN_UPLINK {
+                            source: 'correlator',
+                            via: 'mx_uplink',
+                            wan_slot: $slot
+                        }]->(i)
+                        SET r.public_ip   = $public_ip,
+                            r.private_ip  = $private_ip,
+                            r.dimension   = 'wan',
+                            r.updated_at  = timestamp()
+                        SET d.is_wan_edge      = true,
+                            d.wan_edge_reason  = 'mx_uplink'
+                        RETURN count(r) AS n
+                        """,
+                        dev_id=mx["dev_id"],
+                        slot=slot,
+                        public_ip=mx["public_ip"],
+                        private_ip=mx["private_ip"],
+                    )
+                    rec = await res.single()
+                    created += rec["n"] if rec else 0
 
         # ── Pull every (device, remote_as) pair once and split them
         # into iBGP (home AS) vs eBGP (everything else public).
@@ -2449,13 +2625,13 @@ async def _infer_wan_topology() -> int:
             RETURN d.id   AS dev_id,
                    d.name AS dev_name,
                    r.remote_as AS asn,
-                   collect(DISTINCT p.peer_ip) AS peers
+                   collect(DISTINCT p.peer_ip) AS peers,
+                   collect(DISTINCT p.router_id) AS router_ids
             """
         )).data()
 
         ibgp_devices: set[str] = set()
         ebgp_devices: set[str] = set()
-        as_to_create: dict[int, dict] = {}
         uplinks_to_create: list[dict] = []
 
         for row in rows:
@@ -2472,59 +2648,60 @@ async def _infer_wan_topology() -> int:
                 continue
             # eBGP — real external peer.
             ebgp_devices.add(row["dev_id"])
-            as_to_create.setdefault(asn, {"asn": asn})
             uplinks_to_create.append({
                 "dev_id":     row["dev_id"],
                 "dev_name":   row["dev_name"],
                 "asn":        asn,
                 "peer_ip":    peers[0] if peers else None,
                 "peer_count": len(peers),
+                "router_id":  next((x for x in (row.get("router_ids") or []) if x), None),
             })
 
-        # ── Materialise each external AS, wire TRANSITS to Internet,
-        # and (when we know the home AS) wire AS_PEER to the home AS.
-        for asn_data in as_to_create.values():
-            await session.run(
-                """
-                MERGE (a:AutonomousSystem {id: $id})
-                ON CREATE SET
-                    a.created_at = timestamp(),
-                    a.source_adapter = 'correlator'
-                SET a.asn = $asn,
-                    a.name = 'AS' + toString($asn),
-                    a.type = 'AutonomousSystem',
-                    a.is_home = false,
-                    a.dimensions = ['wan']
-                WITH a
-                MATCH (i:Internet {id: 'internet:0'})
-                MERGE (a)-[t:TRANSITS {source: 'correlator'}]->(i)
-                SET t.dimension = 'wan',
-                    t.updated_at = timestamp()
-                """,
-                id=f"as:{asn_data['asn']}", asn=asn_data["asn"],
-            )
-
-        # ── Border-router WAN_UPLINK edges + AS_PEER boundary edges.
+        # ── Border-router WAN_UPLINK edges to concrete external-peer nodes.
         for up in uplinks_to_create:
+            peer_ip = up.get("peer_ip") or ""
+            asn = up["asn"]
+            peer_suffix = peer_ip if peer_ip else f"{up['dev_id']}:{asn}"
+            peer_id = f"ext-router:{asn}:{peer_suffix}"
+            peer_name = (f"{peer_ip} · AS{asn}" if peer_ip else f"AS{asn}")
             res = await session.run(
                 """
                 MATCH (d:Device {id: $dev_id})
-                MATCH (a:AutonomousSystem {id: $as_id})
+                MATCH (i:Internet {id: 'internet:0'})
+                MERGE (er:ExternalRouter {id: $peer_id})
+                ON CREATE SET
+                    er.created_at = timestamp(),
+                    er.source_adapter = 'correlator'
+                SET er.name = $peer_name,
+                    er.type = 'ExternalRouter',
+                    er.role = 'router',
+                    er.asn = $asn,
+                    er.peer_ip = $peer_ip,
+                    er.router_id = coalesce($router_id, er.router_id),
+                    er.dimensions = ['wan'],
+                    er.updated_at = timestamp()
+                MERGE (er)-[t:TRANSITS {source: 'correlator'}]->(i)
+                SET t.dimension = 'wan',
+                    t.asn = $asn,
+                    t.updated_at = timestamp()
                 MERGE (d)-[r:WAN_UPLINK {
                     source: 'correlator',
                     via: 'ebgp',
                     asn: $asn
-                }]->(a)
+                }]->(er)
                 SET r.peer_ip    = $peer_ip,
                     r.peer_count = $peer_count,
+                    r.peer_router_id = coalesce($router_id, r.peer_router_id),
+                    r.external_peer_id = $peer_id,
                     r.dimension  = 'wan',
                     r.updated_at = timestamp()
                 SET d.is_wan_edge     = true,
                     d.wan_edge_reason = coalesce(d.wan_edge_reason, 'ebgp_public')
                 RETURN count(r) AS n
                 """,
-                dev_id=up["dev_id"], as_id=f"as:{up['asn']}",
-                asn=up["asn"], peer_ip=up["peer_ip"],
+                dev_id=up["dev_id"], peer_id=peer_id, peer_name=peer_name,
+                asn=asn, peer_ip=peer_ip,
+                router_id=up.get("router_id"),
                 peer_count=up["peer_count"],
             )
             rec = await res.single()
@@ -2558,17 +2735,15 @@ async def _infer_wan_topology() -> int:
                 ids=list(in_home_as), asn=home_asn,
             )
 
-        # ── Sweep orphan AutonomousSystem nodes — an upstream AS that
-        # nobody uplinks to any more should disappear so the WAN
-        # overlay stays tidy.  The Internet node is intentionally
-        # left even when nothing uplinks to it (it's a stable
-        # landmark).
+        # ── Sweep orphan WAN helper nodes so the overlay stays tidy.
+        # Internet is intentionally retained as a stable landmark.
         await session.run(
             """
-            MATCH (a:AutonomousSystem)
-            WHERE NOT (a)<-[:WAN_UPLINK]-()
-              AND coalesce(a.source_adapter, '') = 'correlator'
-            DETACH DELETE a
+            MATCH (n)
+            WHERE (n:AutonomousSystem OR n:ExternalRouter)
+              AND coalesce(n.source_adapter, '') = 'correlator'
+              AND NOT (n)<-[:WAN_UPLINK]-()
+            DETACH DELETE n
             """
         )
 
@@ -2578,7 +2753,7 @@ async def _infer_wan_topology() -> int:
                  home_asn=home_asn,
                  ibgp_devices=len(ibgp_devices) if 'ibgp_devices' in locals() else 0,
                  ebgp_devices=len(ebgp_devices) if 'ebgp_devices' in locals() else 0,
-                 external_ases=len(as_to_create) if 'as_to_create' in locals() else 0)
+                 external_peers=len(uplinks_to_create) if 'uplinks_to_create' in locals() else 0)
 
     # ── Replay the snapshotted status-history onto the freshly
     # rebuilt edges so flap-detection survives the destructive
@@ -2803,7 +2978,9 @@ async def _enrich_wan_uplinks_with_health() -> int:
         # → mild yellow (25), unreachable → 70, otherwise 0 (green).
         mx_rows = await (await session.run(
             """
-            MATCH (d:Device)-[r:WAN_UPLINK {via: 'mx_uplink', source: 'correlator'}]->()
+            MATCH (d:Device)-[r:WAN_UPLINK]->()
+            WHERE r.source = 'correlator'
+              AND r.via IN ['mx_uplink', 'mx_upstream']
             RETURN elementId(r) AS rid,
                    coalesce(d.status, '')         AS status,
                    coalesce(d.snmp_health, '')    AS snmp_health,
@@ -2841,14 +3018,26 @@ async def _enrich_wan_uplinks_with_health() -> int:
                 health_source = "mx_device"
 
             snmp_h = (row["snmp_health"] or "").lower()
+            health_reason = None
+            health_status = None
             if oper == "down":
                 health = 80
+                health_reason = "WAN uplink reports down"
+                health_status = "critical"
             elif snmp_h == "unreachable":
-                health = 70
+                # Telemetry gap: keep oper_status signal (up) and mark health unknown
+                # rather than forcing a critical score from missing SNMP reachability.
+                health = 0
+                health_reason = "Health unknown: SNMP telemetry is unreachable"
+                health_status = "unknown"
             elif snmp_h in ("cloud_only", "stale"):
-                health = 25
+                health = 0
+                health_reason = f"Health unknown: limited telemetry ({snmp_h})"
+                health_status = "unknown"
             else:
                 health = 0
+                health_reason = "Uplink and telemetry are healthy"
+                health_status = "healthy"
 
             await session.run(
                 """
@@ -2861,7 +3050,9 @@ async def _enrich_wan_uplinks_with_health() -> int:
                     r.util_in_pct      = coalesce(r.util_in_pct, 0),
                     r.util_out_pct     = coalesce(r.util_out_pct, 0),
                     r.health_score     = $health,
-                    r.health_source    = $health_source
+                    r.health_source    = $health_source,
+                    r.health_reason    = $health_reason,
+                    r.health_status    = $health_status
                 FOREACH (_ IN CASE
                          WHEN coalesce($oper,'') <> coalesce(prev_oper,'')
                           AND $oper IS NOT NULL
@@ -2874,6 +3065,8 @@ async def _enrich_wan_uplinks_with_health() -> int:
                 oper_raw=per_uplink_raw,
                 health=health,
                 health_source=health_source,
+                health_reason=health_reason,
+                health_status=health_status,
                 now=_now_ms(),
             )
             updated += 1
