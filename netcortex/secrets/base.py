@@ -70,6 +70,15 @@ class SecretPaths:
                              cdFMC: key_id + access_token + refresh_token
                                      (api_token supported for compatibility),
                                      optional base_url/region/token_url }
+          thousandeyes:    { api_token (required, OAuth2 bearer),
+                             base_url (optional, default https://api.thousandeyes.com/v7),
+                             aid (optional account-group ID; auto-discovered if blank),
+                             verify_ssl (optional, default true),
+                             expand_endpoint_agents (optional, default true),
+                             include_cloud_agents (optional, default false;
+                                set true to ingest TE's shared public cloud
+                                fleet alongside customer-owned agents),
+                             include_internet_insights (optional, default false) }
           snmp:            { community, version, auth_key, priv_key, ip_range }
 
         Any instance may also include:

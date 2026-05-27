@@ -3872,7 +3872,20 @@ function initCy(elements) {
     // cause of "this link only shows VLAN 1 but really carries 27").
     // The single-line on-canvas label intentionally collapses to
     // ``N VLANs`` — the full per-side list lives here.
-    if (type === 'PHYSICAL_LINK') {
+    //
+    // Inferred PHYSICAL_LINKs (``arp_correlation`` / ``mac_correlation``)
+    // are *correlation artefacts*, not L2 telemetry — one or both sides
+    // is typically a host with no trunk/native/allow-list to compare.
+    // The traversal flow ("N VLANs on switch only, dropped by host")
+    // is therefore meaningless and confusing, so we skip the whole
+    // block for those protos. The discovery proto + interface_a are
+    // still shown in the header above, which captures everything that
+    // can honestly be said about an inferred link.
+    const _inferredProto = (
+      d.discovery_proto === 'arp_correlation' ||
+      d.discovery_proto === 'mac_correlation'
+    );
+    if (type === 'PHYSICAL_LINK' && !_inferredProto) {
       const trunkA = d.trunk_mode_a;
       const trunkB = d.trunk_mode_b;
       const nativeA = d.native_vlan_a;

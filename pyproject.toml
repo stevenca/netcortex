@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "netcortex"
-version = "0.6.0.dev46"
+version = "0.6.0.dev51"
 description = "The intelligence layer for your network — multi-dimensional graph of the network bridging Meraki, Catalyst Center, Intersight, and more with NetBox as SoT"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -90,6 +90,7 @@ snmp = "netcortex.adapters.snmp:SnmpAdapter"
 generic_rest = "netcortex.adapters.generic_rest:GenericRestAdapter"
 vsphere = "netcortex.adapters.vsphere:VSphereAdapter"
 fmc = "netcortex.adapters.fmc:FmcAdapter"
+thousandeyes = "netcortex.adapters.thousandeyes:ThousandEyesAdapter"
 
 [tool.ruff]
 line-length = 100

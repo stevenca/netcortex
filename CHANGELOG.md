@@ -24,6 +24,128 @@ and this file MUST be updated together whenever `__version__` changes.
 
 ---
 
+## [Unreleased — 0.6.0-dev51]
+
+### Fixed (dev51)
+- **`make helm-upgrade` now reliably rolls pods to the new code** (`Makefile`).
+
+  Both the web and worker Deployments reference
+  `localhost:32000/netcortex:latest`. `helm upgrade` writes the same tag
+  string back into the Deployment spec, so Kubernetes sees no change
+  and skips the rollout — even though `pullPolicy: Always` is set.
+  Pods kept running whatever version of `:latest` they happened to pull
+  at their last restart, so a `make helm-upgrade` would silently leave
+  stale code in production (this is how dev48-dev50 shipped to the
+  worker but stranded the web pod on dev47 for 40+ minutes).
+
+  The Makefile now:
+  - Parses the version from `pyproject.toml` into `PKG_VERSION`.
+  - Tags every `docker build` with BOTH `:$(PKG_VERSION)` and `:latest`.
+  - Pushes both tags.
+  - Passes `--set image.tag=$(PKG_VERSION)` to `helm upgrade`, so the
+    Deployment spec's `image:` field actually changes between releases,
+    which is what makes Kubernetes diff the pod-template-hash and roll
+    the pods.
+
+  Side benefits: every running pod self-identifies its build via
+  `kubectl describe pod`, and earlier images stay addressable for
+  rollback (`make helm-upgrade TAG=0.6.0.dev49`).
+
+## [Unreleased — 0.6.0-dev50]
+
+### Fixed (dev50)
+- **Suppress L2 / VLAN block on inferred PHYSICAL_LINKs**
+  (`netcortex/status/templates/index.html`).
+
+  Edge hover tooltips for `discovery_proto = arp_correlation` /
+  `mac_correlation` were rendering the same per-side trunk/native/allow-
+  list comparison we use for real LLDP/CDP/Meraki/CATC cables. That
+  comparison is meaningless for correlation artefacts: one end is almost
+  always a host (TE agent, endpoint, server) with no trunk-mode, no
+  native VLAN, and no port allow-list, so the flow computation always
+  ends up at "N VLANs on switch only (dropped by host)" — which falsely
+  implies a misconfiguration when really we just lack telemetry from the
+  endpoint.
+
+  Both the L2 / VLAN block and the L3 / Prefix block are now gated on
+  the link NOT being an inferred correlation. The protocol, method,
+  confidence, and `interface_a` (the SVI that learned the ARP entry, or
+  the switch port where the MAC was seen) are still surfaced in the
+  header above the gate — which captures everything that can honestly
+  be said about an inferred link.
+
+
+
+### Added (dev49)
+- **ThousandEyes Enterprise agents now stitch into the rest of the topology
+  via synthetic interfaces + IPAddress nodes**
+  (`netcortex/adapters/thousandeyes.py`).
+
+  TE's `/agents` API does not expose LLDP/CDP neighbours or any interface
+  inventory for Enterprise agents — only their configured `ipAddresses[]`.
+  Previously the adapter stored those IPs solely as a `mgmt_ip` property on
+  the Device node, which left the agents as orphan nodes connected only to
+  the TE PlatformSite. The existing ARP/MAC/CAM correlator had no
+  `IPAddress` node to anchor on, so the agent could never be linked to its
+  upstream switch port.
+
+  Discovery now emits, for each Enterprise / Enterprise-Cluster agent (and
+  optionally Cloud agents, when `include_cloud_agents=true`):
+  - one synthetic `Interface` per local IP (named `eth0`, `eth1`, …, with
+    `synthetic=true` and `synthetic_reason="te_api_no_interface_inventory"`
+    on properties so it is obvious in the UI that the iface was inferred),
+  - one `IPAddress` node per IP (de-duped against any IP already in the
+    graph from SNMP/CATC/Meraki/FMC),
+  - `HAS_INTERFACE` and `ASSIGNED_IP` edges.
+
+  With these anchors in place, the existing correlator picks up the ARP
+  binding for `<agent IP> → <MAC>` from the SNMP-collected ARP tables and
+  glues each TE agent onto the access port that actually carries it.
+
+## [Unreleased — 0.6.0-dev48]
+
+### Changed (dev48)
+- **ThousandEyes adapter now ingests only customer-owned vantage points by
+  default** (`netcortex/adapters/thousandeyes.py`,
+  `netcortex/secrets/base.py`, `docs/secrets.md`).
+
+  TE's `/agents` endpoint returns the full Cloud + Enterprise superset with
+  no server-side filter. The adapter now skips the shared Cloud fleet by
+  default — discovery is limited to Enterprise agents, Enterprise Clusters,
+  and Endpoint agents (i.e. the vantage points the customer actually owns).
+  Set `include_cloud_agents: true` in the per-instance secret to opt back
+  into the public cloud fleet (~1000+ entries).
+
+  Operators upgrading from `dev47` should run a one-shot cleanup of cloud
+  TE devices left behind in Neo4j (a `WHERE platform="thousandeyes" AND
+  te_agent_type="cloud" DETACH DELETE` query is sufficient — see ops
+  README).
+
+## [Unreleased — 0.6.0-dev47]
+
+### Added (dev47)
+- **ThousandEyes adapter (vantage-point ingest, phase 1)**
+  (`netcortex/adapters/thousandeyes.py`, `pyproject.toml`,
+  `netcortex/secrets/base.py`, `docs/secrets.md`).
+
+  New `thousandeyes` adapter targets the published v7 REST API
+  (`https://api.thousandeyes.com/v7`) using an OAuth2 user bearer token.
+  Discovery emits:
+  - one `PlatformSite` per configured account group,
+  - every Cloud / Enterprise / Enterprise-Cluster agent as a `Device`
+    (mgmt_ip from `ipAddresses`, ASN/ISP parsed from `network`, cluster
+    members wired up as `LOCATED_AT` edges with `relationship=cluster_member`),
+  - every Endpoint agent as a `Device` plus its `networkInterfaceProfiles`
+    as `Interface` nodes with `ASSIGNED_IP` edges (wireless SSID/BSSID/RSSI,
+    Ethernet link speed, gateway, prefix length are kept on properties).
+
+  Active alerts (`/alerts?state=trigger`) and, when enabled,
+  Internet Insights outages (`/internet-insights/outages/filter`) are
+  fetched and surfaced as counts on the platform-site node so MCP problem
+  tools can pick them up without a second round-trip. Account group ID
+  (`aid`) is auto-discovered via `/account-groups` when the secret leaves
+  it blank.
+
 ## [Unreleased — 0.6.0-dev46]
 
 ### Fixed (dev46)

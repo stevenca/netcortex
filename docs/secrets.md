@@ -53,6 +53,7 @@ Multiple instances of the same type are fully supported — one secret per insta
 | `netcortex/adapters/nexus_dashboard/dc2-prod` | `url`, `username`, `password` |
 | `netcortex/adapters/fmc/onprem-prod` | `deployment_mode=onprem`, `url`, `username`, `password`, `domain_uuid` (optional; auto-discovered if omitted), `domain_name` (optional selector), `expand_details` (default true) |
 | `netcortex/adapters/fmc/cloud-prod` | `deployment_mode=cdfmc`, `key_id`, `access_token`, `refresh_token`, `domain_uuid` (optional; auto-discovered if omitted), `domain_name` (optional selector), `region` or `base_url`, `expand_details` (default true) |
+| `netcortex/adapters/thousandeyes/CPN` | `api_token` (OAuth2 bearer), `base_url` (optional, default `https://api.thousandeyes.com/v7`), `aid` (optional; auto-discovered if blank), `verify_ssl` (default true), `expand_endpoint_agents` (default true), `include_cloud_agents` (default false — set true to ingest TE's shared cloud fleet alongside customer-owned agents), `include_internet_insights` (default false) |
 | `netcortex/adapters/snmp/legacy-floor2` | `community`, `version`, `ip_range`, `auth_key`, `priv_key` |
 
 ### Device Credentials
@@ -216,6 +217,11 @@ aws secretsmanager create-secret \
 aws secretsmanager create-secret \
   --name netcortex/adapters/fmc/cloud-prod \
   --secret-string '{"deployment_mode":"cdfmc","key_id":"...","access_token":"...","refresh_token":"...","region":"us","domain_name":"Global","verify_ssl":true}'
+
+# ThousandEyes (one secret per account group; aid optional)
+aws secretsmanager create-secret \
+  --name netcortex/adapters/thousandeyes/CPN \
+  --secret-string '{"api_token":"...","base_url":"https://api.thousandeyes.com/v7","aid":"","verify_ssl":true,"expand_endpoint_agents":true,"include_cloud_agents":false,"include_internet_insights":false}'
 
 # Site-wide device creds
 aws secretsmanager create-secret \
