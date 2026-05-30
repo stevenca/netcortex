@@ -540,6 +540,7 @@ async def _netbox_enrich_loop(cfg, interval: int = 300) -> None:
     from netcortex.sync.netbox_enrich import (
         enrich_devices_from_netbox,
         enrich_prefixes_from_netbox_ipam,
+        enrich_sites_from_netbox,
     )
 
     log.info("worker.netbox_enrich_loop_start", interval_s=interval)
@@ -551,6 +552,19 @@ async def _netbox_enrich_loop(cfg, interval: int = 300) -> None:
 
         if _shutdown.is_set():
             break
+
+        # Sites first — stamps netbox_site_slug onto PlatformSite nodes so
+        # enrich_devices_from_netbox can propagate the slug to child devices
+        # that have no direct NetBox device record.
+        try:
+            scounts = await enrich_sites_from_netbox(
+                cfg.netbox_url,
+                cfg.netbox_token,
+                verify_ssl=cfg.netbox_verify_ssl,
+            )
+            log.info("worker.netbox_site_enrich_done", **scounts)
+        except Exception as exc:
+            log.error("worker.netbox_site_enrich_failed", error=str(exc))
 
         try:
             counts = await enrich_devices_from_netbox(
@@ -578,6 +592,51 @@ async def _netbox_enrich_loop(cfg, interval: int = 300) -> None:
         except asyncio.TimeoutError:
             pass
     log.info("worker.netbox_enrich_loop_stop")
+
+
+async def _netbox_writeback_loop(cfg, interval: int = 1800) -> None:
+    """Write observed graph state back to NetBox every ``interval`` seconds.
+
+    Runs after the first discovery cycle completes (same gate as the enrich
+    loop) so that graph Device nodes are populated before we attempt to
+    reconcile them.  The default interval is 30 minutes — frequent enough
+    to keep NetBox current, conservative enough to avoid overwhelming the
+    NetBox API.
+
+    Only *additive / fill-blank* writes are made; no existing NetBox data
+    is ever overwritten.  See :mod:`netcortex.sync.netbox_writeback` for
+    the full rule set.
+    """
+    from netcortex.sync.netbox_writeback import reconcile_to_netbox
+
+    log.info("worker.netbox_writeback_loop_start", interval_s=interval)
+    while not _shutdown.is_set():
+        try:
+            await asyncio.wait_for(_discovery_done.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+
+        if _shutdown.is_set():
+            break
+
+        try:
+            report = await reconcile_to_netbox(
+                cfg.netbox_url,
+                cfg.netbox_token,
+                verify_ssl=cfg.netbox_verify_ssl,
+                dry_run=False,
+            )
+            summary = report.get("summary", {})
+            log.info("worker.netbox_writeback_done", **summary)
+        except Exception as exc:
+            log.error("worker.netbox_writeback_failed", error=str(exc))
+
+        try:
+            await asyncio.wait_for(_shutdown.wait(), timeout=interval)
+            break
+        except asyncio.TimeoutError:
+            pass
+    log.info("worker.netbox_writeback_loop_stop")
 
 
 async def _netbox_sync_loop(cfg, interval: int = 300) -> None:
@@ -702,6 +761,14 @@ async def _main() -> None:
     tasks.append(asyncio.create_task(
         _netbox_enrich_loop(cfg, interval=cfg.sync_interval),
         name="netbox-enrich",
+    ))
+
+    # NetBox write-back — pushes observed graph state (serials, interfaces,
+    # IPs, LLDP/CDP cables) back to NetBox.  Runs every 30 min; additive
+    # writes only (fill-blank serials, create missing interfaces/IPs/cables).
+    tasks.append(asyncio.create_task(
+        _netbox_writeback_loop(cfg, interval=1800),
+        name="netbox-writeback",
     ))
 
     # Correlation loop runs regardless of whether adapters are configured

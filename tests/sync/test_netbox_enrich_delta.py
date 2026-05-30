@@ -53,9 +53,12 @@ def test_name_delta_recorded_when_observed_differs() -> None:
         current_serial="FCH2903782Y",
     )
     assert delta == {
-        "name": {
-            "intent": "cpn-ful-aipod-fi-A",
-            "current": "FI-A-FCH2903782Y",
+        "type": "field_mismatch",
+        "fields": {
+            "name": {
+                "intent": "cpn-ful-aipod-fi-A",
+                "current": "FI-A-FCH2903782Y",
+            },
         },
     }
 
@@ -72,9 +75,12 @@ def test_serial_delta_when_match_was_by_name_only() -> None:
         current_serial="NEW-SERIAL-002",
     )
     assert delta == {
-        "serial": {
-            "intent": "OLD-SERIAL-001",
-            "current": "NEW-SERIAL-002",
+        "type": "field_mismatch",
+        "fields": {
+            "serial": {
+                "intent": "OLD-SERIAL-001",
+                "current": "NEW-SERIAL-002",
+            },
         },
     }
 
@@ -86,7 +92,8 @@ def test_both_deltas_recorded_when_both_differ() -> None:
         current_name="observed-name",
         current_serial="observed-serial",
     )
-    assert set(delta.keys()) == {"name", "serial"}
+    assert delta["type"] == "field_mismatch"
+    assert set(delta["fields"].keys()) == {"name", "serial"}
 
 
 @pytest.mark.parametrize("netbox_name,current_name", [
@@ -101,12 +108,13 @@ def test_name_delta_skipped_when_either_side_missing(
     record because the absent side may simply not have been collected
     yet (transient state) and we'd flap the delta every cycle.
     """
-    assert "name" not in _compute_netbox_delta(
+    result = _compute_netbox_delta(
         netbox_name=netbox_name,
         netbox_serial="",
         current_name=current_name,
         current_serial="",
     )
+    assert "name" not in (result.get("fields") or {})
 
 
 def test_serial_comparison_is_case_insensitive() -> None:

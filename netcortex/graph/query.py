@@ -48,6 +48,18 @@ def _graph_cache_key(**kwargs: Any) -> str:
     raw = json.dumps(normalized, sort_keys=True, default=str).encode()
     return hashlib.sha256(raw).hexdigest()[:20]
 
+
+def _node_label(props: dict, fallback: str = "") -> str:
+    """Return the display label for a graph node.
+
+    For Device nodes, ``display_name`` holds the NetBox-authoritative name
+    (set by ``enrich_devices_from_netbox`` and ``enrich_sites_from_netbox``).
+    All other node types (Interface, VLAN, PlatformSite, …) don't have
+    ``display_name``, so this transparently falls back to ``name`` for them.
+    """
+    return props.get("display_name") or props.get("name") or fallback
+
+
 # Structural edge types that define the container hierarchy.
 # These are NEVER returned as Cytoscape edges — instead they populate the
 # `parent` field on child nodes so Cytoscape renders compound containers.
@@ -342,7 +354,7 @@ async def _get_full_graph_impl(  # noqa: C901 — intentionally large function
                 container_nodes[nid] = {
                     "data": {
                         "id": nid,
-                        "label": nprops.get("name", nid),
+                        "label": _node_label(nprops, nid),
                         "type": nt,
                         **_safe_props(nprops),
                     }
@@ -683,7 +695,7 @@ async def _get_full_graph_impl(  # noqa: C901 — intentionally large function
                     el: dict[str, Any] = {
                         "data": {
                             "id": nid,
-                            "label": nprops.get("name", nid),
+                            "label": _node_label(nprops, nid),
                             "type": ntype,
                             **_safe_props(nprops),
                         }
@@ -845,7 +857,7 @@ async def _get_full_graph_impl(  # noqa: C901 — intentionally large function
                 el: dict[str, Any] = {
                     "data": {
                         "id": did,
-                        "label": p.get("name", did),
+                        "label": _node_label(p, did),
                         "type": _node_type(rec["lbls"]),
                         **_safe_props(p),
                     }
@@ -1342,10 +1354,10 @@ async def get_filter_catalog() -> dict[str, Any]:
               AND (d.stub IS NULL OR d.stub = false OR (d)--())
               AND d.name IS NOT NULL AND d.name <> ''
             RETURN d.id AS id,
-                   d.name AS name,
+                   coalesce(d.display_name, d.name) AS name,
                    coalesce(d.netbox_site_slug, '') AS site_slug,
                    coalesce(d.netbox_site_name, d.platform_container, '') AS site_label
-            ORDER BY d.name
+            ORDER BY coalesce(d.display_name, d.name)
             LIMIT 5000
             """
         )).data()
@@ -1419,7 +1431,7 @@ async def get_inventory() -> dict[str, Any]:
             "RETURN properties(d) AS dev, "
             "       labels(ps) AS ps_labels, "
             "       ps.name AS ps_name "
-            "ORDER BY d.name "
+            "ORDER BY coalesce(d.display_name, d.name) "
             "LIMIT 2000",
         )
         records = await result.data()
@@ -1553,7 +1565,7 @@ async def get_cam_correlated() -> dict[str, Any]:
         r_learned = await session.run(
             "MATCH (sw:Device)-[:HAS_INTERFACE]->(i:Interface)-[r:LEARNED_MAC]->(m:MACAddress) "
             "RETURN m.mac AS mac, "
-            "       sw.name AS learned_on_device, "
+            "       coalesce(sw.display_name, sw.name) AS learned_on_device, "
             "       i.name AS learned_on_port, "
             "       coalesce(r.vlan, m.vlan) AS vlan, "
             "       m.vendor AS vendor, "
@@ -1566,7 +1578,7 @@ async def get_cam_correlated() -> dict[str, Any]:
         # Collect all device-owns-MAC entries
         r_owns = await session.run(
             "MATCH (d:Device)-[r:OWNS_MAC]->(m:MACAddress) "
-            "RETURN m.mac AS mac, d.name AS owner_device, "
+            "RETURN m.mac AS mac, coalesce(d.display_name, d.name) AS owner_device, "
             "       r.nic_name AS nic_name, d.role AS owner_role",
         )
         owns_records = await r_owns.data()
@@ -1727,7 +1739,7 @@ async def get_top_problems_inventory() -> list[dict[str, Any]]:
               AND (d.stub IS NULL OR d.stub = false OR (d)--())
             OPTIONAL MATCH (d)-[:LOCATED_AT]->(ps)
             RETURN
-                d.name AS name,
+                coalesce(d.display_name, d.name) AS name,
                 d.mgmt_ip AS mgmt_ip,
                 coalesce(d.netbox_site_name, d.platform_container, ps.name, '') AS site,
                 toLower(coalesce(d.oper_state, d.status, d.reachabilityStatus, d.admin_state, '')) AS status,
@@ -1742,7 +1754,7 @@ async def get_top_problems_inventory() -> list[dict[str, Any]]:
                 coalesce(d.snmp_restricted_mibs, []) AS snmp_restricted_mibs,
                 d.meraki_last_reported_at AS meraki_last_reported_at,
                 coalesce(d.meraki_last_reported_at_iso, '') AS meraki_last_reported_at_iso
-            ORDER BY d.name
+            ORDER BY coalesce(d.display_name, d.name)
             LIMIT 5000
             """
         )
@@ -1826,7 +1838,7 @@ async def get_stp_topology() -> dict[str, Any]:
 
         r_roots = await session.run(
             "MATCH (d:Device)-[:STP_ROOT]->(dom:STPDomain) "
-            "RETURN dom.id AS domain_id, d.name AS root_name, "
+            "RETURN dom.id AS domain_id, coalesce(d.display_name, d.name) AS root_name, "
             "       d.id AS root_id, d.model AS model "
             "LIMIT 1000"
         )
@@ -1838,7 +1850,7 @@ async def get_stp_topology() -> dict[str, Any]:
 
         r_members = await session.run(
             "MATCH (d:Device)-[r:STP_MEMBER]->(dom:STPDomain) "
-            "RETURN dom.id AS domain_id, d.name AS dev_name, d.id AS dev_id, "
+            "RETURN dom.id AS domain_id, coalesce(d.display_name, d.name) AS dev_name, d.id AS dev_id, "
             "       r.bridge_priority AS priority, r.root_path_cost AS path_cost "
             "LIMIT 5000"
         )
@@ -1858,7 +1870,7 @@ async def get_stp_topology() -> dict[str, Any]:
             "MATCH (i:Interface)-[r:STP_LINK]->(dom:STPDomain) "
             "OPTIONAL MATCH (d:Device)-[:HAS_INTERFACE]->(i) "
             "RETURN dom.id AS domain_id, "
-            "       d.name AS device_name, d.id AS device_id, "
+            "       coalesce(d.display_name, d.name) AS device_name, d.id AS device_id, "
             "       i.name AS port_name, i.id AS port_id, "
             "       r.port_state AS state, r.port_role AS role, "
             "       r.path_cost AS cost, r.priority AS prio "
@@ -1936,7 +1948,7 @@ async def get_routing_topology() -> dict[str, Any]:
         r_prefixes = await session.run(
             "MATCH (d:Device)-[r:ROUTES_TO]->(p:Prefix) "
             "WHERE d.stub IS NULL OR d.stub = false "
-            "RETURN d.name AS device, d.id AS device_id, "
+            "RETURN coalesce(d.display_name, d.name) AS device, d.id AS device_id, "
             "       coalesce(p.prefix, p.cidr) AS prefix, p.version AS ip_version, "
             "       r.interface AS interface, r.ip AS ip "
             "LIMIT 5000"
@@ -2283,7 +2295,9 @@ async def get_device_explorer(
             """
             MATCH (d:Device)
             WHERE d.id = $key
+               OR toLower(coalesce(d.display_name, '')) = toLower($key)
                OR toLower(coalesce(d.name, '')) = toLower($key)
+               OR toLower(split(coalesce(d.display_name, ''), '.')[0]) = toLower($key)
                OR toLower(split(coalesce(d.name, ''), '.')[0]) = toLower($key)
             RETURN properties(d) AS dev
             ORDER BY CASE WHEN d.id = $key THEN 0 ELSE 1 END,
