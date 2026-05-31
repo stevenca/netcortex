@@ -1,6 +1,8 @@
 # NetCortex Architecture
 
-> **Primary reference**: see **[implementation-journal.md](implementation-journal.md)** for the complete, up-to-date record of what is built, how it works, all design decisions, the secrets schema, current graph state, and operational procedures. Where this file conflicts with the journal, the journal wins.
+> **Forward-looking target architecture (post-`0.7.0`)**: see **[architecture/brain.md](architecture/brain.md)** — the brain-mapped agentic redesign with thalamus/event bus, reflex/cognitive split, memory layers, LLM router, and three external surfaces (MCP, A2A, subscription stream). That is where `0.8.0` and beyond is headed.
+>
+> **Primary reference for what is built today**: see **[implementation-journal.md](implementation-journal.md)** for the complete, up-to-date record of what is built, how it works, all design decisions, the secrets schema, current graph state, and operational procedures. Where this file conflicts with the journal, the journal wins.
 
 ## Design evolution: graph-centric architecture
 
