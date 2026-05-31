@@ -1,0 +1,38 @@
+name: Security concern
+description: A vulnerability, suspected leak, or hardening request. PRIVATE issues preferred.
+labels: ["security"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **If this is an exploitable vulnerability**, please consider emailing the maintainer
+        directly rather than filing a public issue. For non-exploitable hardening requests,
+        proceed below.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+    validations:
+      required: true
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity (your assessment)
+      options:
+        - Critical (exploitable, data exposure, RCE)
+        - High
+        - Medium
+        - Low / hardening
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: What is the issue? Include affected modules and attack scenario.
+    validations:
+      required: true
+  - type: textarea
+    id: mitigation
+    attributes:
+      label: Suggested mitigation (optional)

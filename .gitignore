@@ -1,4 +1,7 @@
+# --- Python ---
 .env
+.env.*
+!.env.example
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -6,8 +9,60 @@ dist/
 build/
 .venv/
 venv/
+
+# --- Tooling caches ---
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# --- Local data & memory (never committed) ---
 data/
+memory/
 *.sqlite
+*.duckdb
+
+# --- Agent / LLM scratch ---
+agent-logs/
+.cursor-sessions/
+.claude-sessions/
+
+# --- VCR / pytest-recording cassettes ---
+# Sanitized cassettes (the only ones safe to commit) live at
+# tests/cassettes/*.yaml — those ARE tracked. Anything else under
+# tests/cassettes/ is treated as unsanitized scratch and ignored.
+tests/cassettes/*.unsanitized.*
+tests/cassettes/*.raw.*
+tests/cassettes/_scratch/
+
+# --- Secrets / credentials (defense-in-depth; should never exist on disk) ---
+*.pem
+*.key
+!tests/**/*.pem  # test fixtures with throwaway certs ARE allowed
+*.splunk-token
+.aws-creds
+.aws/credentials.local
+secrets.yaml
+secrets.json
+*.bedrock-key
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# --- Build / packaging ---
+*.tgz
+*.tar.gz
+deploy/charts/*/charts/
+deploy/charts/*/Chart.lock
+
+# --- Generated artifacts ---
+sbom.json
+sbom.spdx.json
+plugins.manifest.json

@@ -1,0 +1,56 @@
+name: Bug report
+description: Something is wrong or behaving unexpectedly
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One or two sentences. What is broken?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Repro
+      description: Minimal steps to reproduce. Include adapter, command, or UI path.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include logs, error messages, NetBox object IDs if relevant. Scrub secrets.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: NetCortex version
+      placeholder: "e.g. 0.7.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Subsystem (best guess)
+      options:
+        - sensory / adapter
+        - association / correlator
+        - motor / NetBox writeback
+        - bridge / MCP
+        - bridge / UI
+        - policy / preference
+        - other / not sure
+    validations:
+      required: false
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context

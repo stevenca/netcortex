@@ -24,6 +24,65 @@ and this file MUST be updated together whenever `__version__` changes.
 
 ---
 
+## [0.7.1-dev1] — 2026-05-31
+
+### Added (CI + documentation foundation for the brain-mapped refactor)
+
+- `docs/architecture/brain.md` and `brain.png` — visual and write-up for
+  the post-0.7.0 brain-mapped agentic architecture (already shipped in
+  commit `502a392`; reiterated here for changelog visibility).
+- `.github/workflows/ci.yaml` — full PR pipeline with `lint`, `typecheck`,
+  `unit`, `golden`, `contracts`, `replay` (offline integration), `security`,
+  and `sbom` jobs. Runs on GitHub-hosted `ubuntu-latest` runners; can be
+  re-targeted to self-hosted when 0.11.0 needs live-cluster smoke.
+- `.github/CODEOWNERS` — protects `docs/architecture/`, `netcortex/contracts/`,
+  `netcortex/policy/`, `.github/`, and the lint tools.
+- `.github/pull_request_template.md` — short, structured PR template with a
+  dedicated "For agent reviewers" section so an automated reviewer (future)
+  has a clean handoff.
+- `.github/ISSUE_TEMPLATE/{bug,feature,security}.yaml` and `config.yml` —
+  pointed at the brain-architecture doc and implementation journal as
+  reading material. Blank issues disabled.
+- `CONTRIBUTING.md` — first-class guidance for both human and agent
+  contributors, pointing at the architecture doc, the CI rules, and the
+  "no self-rewrite" + "no unsanitized cassettes" hard rules.
+- `tools/sanitize_cassette.py` — scrubs IPv4/IPv6, MAC, Meraki serials,
+  Cisco keyed serials, JWTs, AWS keys/ARNs, bearer tokens, private keys,
+  and customer hostnames from VCR / pytest-recording cassettes. Preserves
+  RFC1918 /16 structure so graph-correlation tests stay representative.
+- `tools/lint_no_self_rewrite.py` — AST-based lint forbidding
+  `exec`/`eval`/`compile` everywhere and dynamic `importlib.import_module()`
+  + writes to `netcortex/{policy,contracts}/` from agent paths. Enforces the
+  regulatory/security invariant from `docs/architecture/brain.md` that the
+  agent layer cannot mutate its own policy library or contracts.
+- `tools/lint_no_unsanitized_cassettes.py` — CI gate that pairs with the
+  sanitizer; refuses merge if any committed cassette would still be mutated.
+- `tests/golden/`, `tests/cassettes/`, `tests/contracts/` skeletons with
+  convention READMEs spelling out workflow, what belongs where, and the
+  approval flow for snapshot changes.
+
+### Changed
+
+- `.gitignore` extended for cassette scratch files, episodic-memory dumps,
+  agent logs, Splunk/Bedrock/AWS local credentials, SBOM artifacts, and the
+  plugin manifest.
+- `pyproject.toml` dev group adds `pytest-recording`, `vcrpy`, `hypothesis`,
+  and `pip-audit` to support the new CI jobs.
+- `docs/architecture.md` — forward-pointer banner directing readers to
+  `docs/architecture/brain.md` for the target architecture.
+- `README.md` — version bumped to 0.7.0 (was stale at 0.4.0) and a pointer
+  to the brain doc + `CONTRIBUTING.md` added near the top.
+
+### Not yet (deferred to 0.7.x follow-ups)
+
+- `netcortex/contracts/` namespace with the first three Protocol stubs
+  (`EventBus`, `SensoryAdapter`, `Policy`) — held until the user
+  explicitly approves adding code (this release is docs + CI only).
+- First five golden snapshots — lands in `0.7.1-dev2`.
+- First recorded NetBox cassette — lands with first integration test.
+- `mypy --strict` clean across the existing codebase — current CI runs
+  mypy in best-effort mode; tightening is a separate workstream.
+
 ## [0.7.0] — 2026-05-31
 
 ### Release summary

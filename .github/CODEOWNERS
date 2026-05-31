@@ -1,0 +1,17 @@
+# Default owner — everything not otherwise matched.
+*                                   @stevenca
+
+# Architecture & policy — owner review required for any change.
+docs/architecture/                  @stevenca
+netcortex/contracts/                @stevenca
+netcortex/policy/                   @stevenca
+
+# CI / build / supply chain — owner review required.
+.github/                            @stevenca
+pyproject.toml                      @stevenca
+tools/lint_no_self_rewrite.py       @stevenca
+tools/sanitize_cassette.py          @stevenca
+
+# Test infrastructure — owner review required for golden snapshots.
+tests/golden/                       @stevenca
+tests/contracts/                    @stevenca

@@ -2,9 +2,13 @@
 
 > **The intelligence layer for your network.** NetCortex connects to any network platform API — Meraki, Catalyst Center, Intersight, and beyond — normalizes everything into NetBox's data model, and exposes it all through a unified MCP server so AI agents can reason across your entire infrastructure.
 
-**Current version: 0.4.0.** See [`CHANGELOG.md`](CHANGELOG.md) for the
+**Current version: 0.7.0.** See [`CHANGELOG.md`](CHANGELOG.md) for the
 release history and [`docs/implementation-journal.md`](docs/implementation-journal.md)
 for the deep-dive design record (with [§17 Versioning Policy](docs/implementation-journal.md#17-versioning-policy)).
+
+> **Where this is headed (post-`0.7.0`):** see **[`docs/architecture/brain.md`](docs/architecture/brain.md)** — the brain-mapped agentic redesign with a NATS event bus, reflex/cognitive split, sensory unification (poll + webhooks + SNMP traps + Cisco streaming telemetry), memory layers, LLM router, and three external surfaces (MCP, A2A, SSE subscription stream).
+>
+> Contributing? Read **[`CONTRIBUTING.md`](CONTRIBUTING.md)** first.
 
 ---
 
