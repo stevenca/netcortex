@@ -24,7 +24,1024 @@ and this file MUST be updated together whenever `__version__` changes.
 
 ---
 
-## [Unreleased — 0.6.0-dev51]
+## [0.7.0] — 2026-05-31
+
+### Release summary
+
+0.7.0 is the NetBox-as-system-of-record release. It started from a small bug
+fix on top of 0.6.0 and grew into 66 dev iterations that re-shaped how
+NetCortex talks to NetBox, what it claims authority over, and how it heals
+its own mistakes when those claims turn out wrong. The headline themes:
+
+* **NetBox is authoritative for identity** — device names with matching
+  serial / MAC stay as NetBox has them; platform names only win on
+  first-create. Multiple Meraki networks can map to one NetBox site via
+  the `meraki_networks` custom field, with site-collision detection and
+  duplicate-device dedup.
+* **First-ever sync of L2 state to NetBox** — per-port admin status, mode,
+  untagged/tagged VLAN assignments, voice VLAN, and Cisco STP extensions
+  (PortFast, BPDU/Root/Loop guard) from both Meraki port-config API and
+  CISCO-STP-EXTENSIONS-MIB. Interface PATCH path preserves operator-set
+  fields and only fills blanks.
+* **First-ever sync of VLANs to NetBox** — canonical `(site, vid)` VLAN
+  inventory with per-site VLAN groups that *adopt the operator's existing
+  group* rather than creating a parallel one. VID-collision-safe dedup
+  via NetBox's `on_delete=SET_NULL` cascade. One-shot cleanup of earlier
+  experimental `nc-*` groups.
+* **Routing-table enrichment** — received AutoVPN routes per MX emitted as
+  derived `ROUTES_TO` edges, with asymmetric-advertisement and
+  overlapping-advertisement audits feeding the problems list. Prefix
+  reconciler carries `nc_advertisers` per CIDR.
+* **Managed-address-space filter** — only IP/prefix space declared in
+  `managed_prefixes` is written to NetBox; unmanaged space surfaces in
+  the problems tab when it appears in routing tables or shows
+  overlap-with-managed conflicts.
+* **Problems tab + UI changes** — dedicated problems view in the web UI,
+  topology load-time fixes, and a NetBox-reconciliation window with
+  bulk approve/reject and object-type filtering.
+* **Custom field auto-creation** — `nc_source`, `nc_stp_*`,
+  `nc_voice_vlan`, `meraki_port_id`, `meraki_networks`, `nc_platform`,
+  `nc_platform_id`, `nc_advertisers` are all created idempotently on
+  first run with NetBox 3.x/4.x compatibility.
+* **Config vs secrets separation** — secrets stay in the secret backend
+  (AWS SM today); config moves to a clean values-style file with
+  `managed_prefixes`, backend pointers, and per-tenant tuning surfaced
+  declaratively.
+* **MCP read/write token split** — the existing MCP API key is now
+  read-only; a separate write-scoped key is required for mutating
+  operations.
+
+This release is the substrate the upcoming agentic work (0.8.0+) sits on.
+The detailed dev1–dev66 log is preserved below as the implementation
+record; new readers should start with the summary above.
+
+---
+
+### Fixed (dev66) — drop interface-level VLAN re-pointing, rely on NetBox SET_NULL
+
+dev65's `_repoint_iface_refs_then_delete_duplicate_vlan` tried to be
+helpful by PATCHing every interface that referenced the duplicate
+VLAN to point at the operator's canonical VLAN before deleting the
+duplicate. Against the live NetBox surface this hit a wall: many
+interfaces have no `mode` set (because they're access points,
+trunks-of-trunks, virtuals, etc.), and NetBox rejects any PATCH
+that sets `untagged_vlan` on a mode-less interface with
+`"Interface mode does not support untagged vlan"`. Every PATCH 400'd,
+the dedup function returned False, the migrate-or-prune fell back to
+error reporting, the duplicate VLAN stayed alive, and the `nc-*`
+group stayed alive.
+
+NetBox already has a mechanism for the case where we want to remove
+a VLAN that interfaces point at: `Interface.untagged_vlan` is
+declared `on_delete=SET_NULL`, and `tagged_vlans` is a many-to-many,
+so deleting the VLAN cleanly nulls/removes every reference without
+needing per-interface PATCHes. dev66 simplifies the helper —
+renamed `_delete_duplicate_vlan` — to do exactly that:
+
+1. Confirm the 400 was a VID collision (operator's VLAN at same
+   `(group, vid)` exists).
+2. Count how many interface references will be cleared by the
+   framework, for reporting (`refs_cleared`).
+3. DELETE our duplicate VLAN. NetBox cascades.
+4. Next reconcile cycle's interface pass finds the operator's VLAN
+   via the dev65 group_id lookup, and the existing patch path sets
+   `untagged_vlan` / `tagged_vlans` correctly — without violating
+   the mode constraint because by then the interface mode is part
+   of the patch payload.
+
+Report keys renamed `refs_repointed` → `refs_cleared`.
+
+### Files touched (dev66)
+
+* `netcortex/netcortex/sync/netbox_writeback.py`
+  * `_repoint_iface_refs_then_delete_duplicate_vlan` renamed to
+    `_delete_duplicate_vlan`; per-interface PATCH loops removed;
+    pre-delete count of would-be-affected interfaces preserved for
+    the report.
+  * `_cleanup_legacy_nc_vlan_groups` — call site updated; counter
+    name changed `refs_repointed` → `refs_cleared`.
+* `netcortex/__init__.py`, `pyproject.toml` — version bump.
+* `CHANGELOG.md` — this entry.
+
+---
+
+## [0.6.0-dev65]
+
+### Fixed (dev65) — resolve VID-collision migrations and stop missing operator VLANs
+
+First-deploy attempt of dev64's cleanup against the live NetBox surfaced
+two real-world failure modes the naive migrate-then-delete didn't handle:
+
+1. **400 on `PATCH vlan.group`** when moving an nc-authored VLAN into
+   the operator's group — the operator already had the same VID in
+   their group, so the move violated NetBox's VID-uniqueness-within-a-
+   group constraint. Result: every duplicate VLAN we tried to migrate
+   stayed put, and the empty parent `nc-*` group couldn't be deleted
+   (409 Conflict).
+2. **Root cause of dev63's duplication.** The pre-write VLAN lookup
+   only queried `?site_id=<sid>`, but operators commonly create
+   per-site VLANs with `vlan.site = null` and rely on the group's
+   site scope for placement. Those VLANs were invisible to the
+   lookup, so reconcile_site_vlans thought no row existed and
+   happily created its own.
+
+**Fix part 1 — `_repoint_iface_refs_then_delete_duplicate_vlan` (new).**
+When the migrate PATCH returns 400, the cleanup now looks up the
+target group for a VLAN with the same VID. If one exists (the
+operator's canonical row), every interface that referenced our
+duplicate via `untagged_vlan` or `tagged_vlans` is PATCHed to point
+at the canonical row, then our duplicate VLAN is DELETEd. Net effect:
+duplicates are pruned without breaking any interface state. New
+report counters `duplicates_pruned` and `refs_repointed` make the
+work visible.
+
+**Fix part 2 — lookup by `group_id` too.** `reconcile_site_vlans` now
+issues a second VLAN paginate per site-scoped group (in addition to
+the `site_id` paginate), and a small `_record()` helper prefers
+rows that already have `group` set when deduping by `(site_id, vid)`.
+Operator VLANs with `site=null` no longer slip through.
+
+**Defense against group-delete cascade**: the cleanup now tracks
+residual VLANs that resisted both migration and prune. If any remain
+after the per-group loop, the parent `nc-*` group's DELETE is
+deferred (logged as `vlan_group.delete_deferred`) — better an orphan
+group lingering for inspection than data loss from a forced cascade.
+
+### Files touched (dev65)
+
+* `netcortex/netcortex/sync/netbox_writeback.py`
+  * `_repoint_iface_refs_then_delete_duplicate_vlan` (new).
+  * `_cleanup_legacy_nc_vlan_groups` — wraps migrate PATCH in
+    400-detection and falls into the dedup-and-repoint path on
+    conflict; tracks residual VLANs and defers group DELETE if any
+    remain; report dict gains `duplicates_pruned`, `refs_repointed`.
+  * `reconcile_site_vlans` — `existing_by_key` is now built from
+    both `site_id` and `group_id` queries, with a `_record()`
+    helper that prefers grouped rows when both shapes return the
+    same VID.
+* `netcortex/__init__.py`, `pyproject.toml` — version bump.
+* `CHANGELOG.md` — this entry.
+
+---
+
+## [0.6.0-dev64]
+
+### Fixed (dev64) — adopt the operator's VLAN group, don't make a parallel one
+
+dev63 was wrong. It created an `nc-<slug>` VLAN group at *every* site
+unconditionally, even sites where the operator already had a per-site
+VLAN group. Result: the NetBox UI showed two parallel groups for those
+sites (e.g. `cpn-ful` and `nc-cpn-ful`), each containing a different
+slice of VLANs, which is exactly the opposite of "NetBox reflects
+network reality".
+
+This release fixes the resolver and adds one-shot cleanup of the dev63
+mess.
+
+**New resolver — `_resolve_site_vlan_group`** in
+`netcortex/sync/netbox_writeback.py`:
+
+1. Look up every VLAN group already scoped to the target site (one
+   `_paginate` of `/api/ipam/vlan-groups/` shared across the pass).
+2. **If any exist, adopt the lowest-id one** — that's typically the
+   operator's canonical choice. If there are multiple, log a notice
+   so the operator can de-duplicate at their leisure.
+3. **Only if none exist, create one ourselves** with the site's own
+   slug/name — no `nc-` prefix, no `(netcortex)` suffix, no
+   self-attribution in the description. Slug-collision fallback:
+   append `-vlans` to the site slug.
+
+**One-shot cleanup — `_cleanup_legacy_nc_vlan_groups`**:
+
+For every group whose slug starts with `nc-` and is scoped to a site:
+
+* **Site has another group** → migrate every VLAN currently in the
+  `nc-*` group to that other group (PATCH `vlan.group = <target>`),
+  then DELETE the empty `nc-*` group.
+* **Site has only the `nc-*` group** → RENAME it in place to the
+  site's slug/name and drop the netcortex-marker description.
+
+The cleanup runs every reconcile cycle but is cheap when there's
+nothing to do (one paginate of vlan-groups). It is idempotent and
+self-healing.
+
+**Naming convention going forward**: the VLAN group we create for a
+site uses the site's own slug as the group slug and the site's own
+name as the group name. The only adjective in the description is
+"Per-site VLAN namespace for &lt;site name&gt;." — no product names.
+
+### Files touched (dev64)
+
+* `netcortex/netcortex/sync/netbox_writeback.py`
+  * `_ensure_site_vlan_group` removed.
+  * `_list_all_site_scoped_vlan_groups` (new) — single source-of-truth
+    map keyed by site id.
+  * `_resolve_site_vlan_group` (new) — adopt-existing-or-create-clean
+    with slug-collision fallback.
+  * `_cleanup_legacy_nc_vlan_groups` (new) — migrate or rename the
+    pre-dev64 `nc-*` groups.
+  * `reconcile_site_vlans` — fetch the groups map once, run cleanup,
+    resolve per site, thread the chosen `group_id` into both CREATE
+    and PATCH payloads. Adds `legacy_cleanup` block to the report
+    (`scanned/renamed/deleted/vlans_moved/skipped/errors`).
+* `netcortex/__init__.py`, `pyproject.toml` — version bump.
+* `CHANGELOG.md` — this entry.
+
+### Verification plan (dev64)
+
+```sh
+# After deploy, the very first reconcile cycle should report the cleanup
+# work and zero groups_created.
+kubectl logs -n netcortex deploy/netcortex-worker --tail=2000 | \
+  grep -E "(vlan_group|site_vlans_done)" | tail -20
+
+# Then confirm in NetBox: every site should have exactly one
+# site-scoped VLAN group, named after the site, and the nc-* groups
+# should be gone.
+```
+
+---
+
+## [0.6.0-dev63]
+
+### Added (dev63) — per-site NetBox VLAN groups
+
+NetBox idiom for per-site VLAN namespaces is an `ipam.vlangroup` whose
+`scope_type=dcim.site` and `scope_id=<that site>`; placing VLANs in the
+group makes VID uniqueness site-local (so two different sites can both
+own VID 10 without colliding) and groups them under the site in the UI.
+Until now `reconcile_site_vlans` was stamping each VLAN with the site
+directly and leaving `group=null`, so multi-site rollouts that reused
+the same VID started bumping into NetBox's global VID-uniqueness check.
+
+This change adds a new pre-step inside `reconcile_site_vlans` that, for
+every site we're about to write VLANs to, ensures a netcortex-owned
+group exists:
+
+* slug:        `nc-<site-slug>`
+* name:        `"<site-name> (netcortex)"`
+* scope_type:  `dcim.site`
+* scope_id:    NetBox site id
+* description: auto-generated marker explaining the group is managed by
+  netcortex.
+
+The naming deliberately namespaces the group with `nc-` so operators can
+keep their own per-site VLAN groups untouched. New helper
+`_ensure_site_vlan_group()` is idempotent (GET-by-slug, POST on miss,
+honours `dry_run`), and surfaces a per-run `groups_created`,
+`groups_existing`, `groups_errored` triple in the `site_vlans` block of
+the writeback summary.
+
+Three call-site changes follow:
+
+1. **CREATE path** — new VLAN payloads now include `"group": <group_id>`
+   alongside `"site": <site_id>`. Both are kept so the VLAN remains
+   linked to the site even if an operator later re-scopes the group.
+2. **PATCH path (nc-authored existing)** — existing VLANs we previously
+   wrote (identifiable via the `nc_source` custom field) are backfilled
+   into the group when they don't already have one. This migrates
+   pre-dev63 rows on the first run.
+3. **Operator-authored existing** — still untouched, including their
+   group choice (or lack of one).
+
+If group creation fails (network glitch, perms, etc.) the VLAN
+writeback continues without a group reference — the failure is logged
+and counted, but VLAN sync still completes. This keeps the new
+behaviour from blocking the rest of the reconcile loop.
+
+### Files touched (dev63)
+
+* `netcortex/netcortex/sync/netbox_writeback.py`
+  * `_ensure_site_vlan_group()` (new) — idempotent per-site VLAN group
+    upsert with friendly name/slug and `dcim.site` scope.
+  * `reconcile_site_vlans()` — captures site name, builds
+    `site_id_to_group_id` via the new helper, threads `group_id` into
+    both CREATE and PATCH payloads, returns `groups_created/existing/
+    errored` in the report.
+* `netcortex/__init__.py`, `pyproject.toml` — version bump.
+* `CHANGELOG.md` — this entry.
+
+### Verification plan (dev63)
+
+```sh
+# Dry-run after deploy to confirm group creation is reported without writes.
+kubectl exec -n netcortex deploy/netcortex-worker -- \
+  python -m netcortex.cli.netbox_writeback --dry-run --json | \
+  jq '.site_vlans | {created, patched, groups_created, groups_existing, groups_errored}'
+
+# Real run.
+kubectl exec -n netcortex deploy/netcortex-worker -- \
+  python -m netcortex.cli.netbox_writeback --json | \
+  jq '.site_vlans | {created, patched, groups_created, groups_existing, groups_errored}'
+
+# Spot-check in NetBox: every newly created group should be visible at
+#   /api/ipam/vlan-groups/?slug=nc-<site-slug>
+# and every nc-authored VLAN at that site should have group=<that group id>.
+```
+
+---
+
+## [0.6.0-dev62]
+
+### Added (dev62) — per-port admin / mode / VLANs / STP, plus first-ever NetBox VLAN sync
+
+Operator request: *"I would like to track whether the port is enabled, the
+port mode (e.g. access, trunk, etc.), allowed VLANs, portfast, and other
+STP settings on the ports. You should be able to get them from the platform
+or SNMP. I would then like to sync this information along with VLANs
+(per site) into netbox."*
+
+Before dev62 the graph stored these per port: `oper_status`, `speed_mbps`,
+`mac`, `mtu`, `description`, `port_id` (Meraki), and a partial L2 set
+(`trunk_mode`, `vlans_access`, `vlans_allowed`, `native_vlan`) populated
+from SNMP only. Admin status was not collected anywhere. STP per-port
+settings (PortFast, BPDU guard, BPDU filter, Root guard, Loop guard) were
+not collected anywhere. The NetBox writeback only created brand-new
+interfaces and never patched existing ones — so any L2/STP state
+discovered after the first sync was invisible to NetBox. There was no
+NetBox VLAN sync at all (`ipam.vlan` was operator-managed only).
+
+The dev62 work threads admin-status, port mode, allowed VLANs, and STP
+settings end-to-end from the platform/SNMP source through the graph
+schema into both new and existing NetBox interfaces, and adds a brand-new
+NetBox VLAN sync pass.
+
+**Phase 1 — Data acquisition (adapters)**
+
+- **Meraki — `get_switch_port_configs()`**: new per-switch call to
+  `GET /devices/{serial}/switch/ports` (the *config* endpoint, distinct
+  from the `/statuses` endpoint already in use). Pulls `enabled`, `type`
+  (access/trunk/stack), `vlan` (untagged), `voiceVlan`, `allowedVlans`
+  (literal `"all"` or a CSV range like `"1,3,5-10"`), `rstpEnabled`,
+  and `stpGuard` (one of `disabled` / `root guard` / `bpdu guard` /
+  `loop guard`). Normalised onto the same vocabulary the SNMP adapter
+  uses (`mode = "access" | "trunk"`, `vlans_allowed` parsed/range-expanded
+  to a sorted list of ints, or the sentinel `"all"`). Throttled through
+  the existing `port_sem` semaphore so we don't burn 2× the Dashboard
+  5 req/s budget. Disjoint from runtime stats; merged into the per-port
+  property bag with `setdefault` so runtime statuses still win on any
+  hypothetical key collision.
+- **SNMP — `_poll_interfaces` extended**: walks `ifAdminStatus`
+  (`1.3.6.1.2.1.2.2.1.7`) and stamps `enabled = (val == 1)` per
+  ifIndex. This is the authoritative source for the NetBox `enabled`
+  flag — `ifOperStatus` alone can't distinguish "shut" from "no cable".
+- **SNMP — `_poll_stp_extensions` (new)**: walks
+  CISCO-STP-EXTENSIONS-MIB to populate per-port `stp_portfast`,
+  `stp_bpdu_guard`, `stp_bpdu_filter`, `stp_root_guard`, and
+  `stp_loop_guard` booleans:
+  * `stpxFastStartPortEnable`           = 1.3.6.1.4.1.9.9.82.1.6.2.1.3
+  * `stpxFastStartPortBpduGuardMode`    = 1.3.6.1.4.1.9.9.82.1.6.2.1.4
+  * `stpxFastStartPortBpduFilterMode`   = 1.3.6.1.4.1.9.9.82.1.6.2.1.5
+  * `stpxRootGuardConfigEnabled`        = 1.3.6.1.4.1.9.9.82.1.13.1.1.1
+  * `stpxLoopGuardConfigEnabled`        = 1.3.6.1.4.1.9.9.82.1.16.1.1.1
+
+  Root Guard / Loop Guard tables are indexed by `dot1dBasePortNumber`,
+  not `ifIndex`, so the new pass also walks
+  `dot1dBasePortIfIndex` (1.3.6.1.2.1.17.1.4.1.2) to translate. Every
+  walk fails soft so Arista / generic Linux switches that don't
+  implement the MIB just leave the fields unset and the cross-adapter
+  merger picks up Meraki's `stp_*_guard` instead.
+- **Graph — Interface node schema extended**: new properties
+  `enabled`, `mode` (string vocabulary shared across Meraki + SNMP),
+  `voice_vlan`, and the five `stp_*` booleans flow through both
+  adapters' Interface-emission paths. The dev61 interface merger
+  already copies any non-listed property from loser→winner with
+  `setdefault`, so when the same physical port is reported by both
+  the Meraki API and SNMP, the surviving canonical Interface ends up
+  with the union of properties (Meraki's `enabled` + SNMP's
+  `stp_bpdu_guard`, etc.).
+
+**Phase 2 — First-ever NetBox VLAN writeback (`reconcile_site_vlans`)**
+
+NetBox had no VLAN sync pass at all before dev62. New top-level
+reconciler `reconcile_site_vlans` runs immediately after `reconcile_device_serials`
+and BEFORE `reconcile_interfaces` (so the interface pass has a vlan_map
+to resolve VLAN references against):
+
+* **Source**: the canonical VLAN nodes already produced by
+  `_canonicalize_vlans_per_fabric` — `vlan:nb:<slug>:<vid>` nodes with
+  `netbox_site_slug`, `vid`, `name`, `description`, `source_adapter`.
+  The correlator already collapsed multi-network / multi-fabric copies
+  into one canonical row per (site, vid), so the writeback gets a
+  clean one-row-per-NetBox-VLAN feed without having to re-dedupe.
+* **Conflict policy — never clobber operator data**:
+  1. A NetBox `ipam.vlan` row WITHOUT the `nc_source` custom field is
+     considered operator-authored — we record its id in the vlan_map
+     so interfaces can reference it, but we never modify its name,
+     description, or any other field.
+  2. A NetBox row WITH `nc_source` set is netcortex-authored — we
+     refresh `name`/`description` only when the graph has something
+     more descriptive than what's there (stub names like `VLAN0010` /
+     `VLAN10` / blank lose to anything else, regardless of which side
+     they're on).
+  3. New rows we create always get `custom_fields.nc_source = <adapter>`
+     so the next run can tell them apart.
+* **Unknown site handling**: VLANs whose canonical `netbox_site_slug`
+  doesn't match a NetBox site are reported under
+  `skipped_unknown_site` + `skipped_unknown_site_slugs` so the
+  operator can fix the site mapping without confusion. Site creation
+  is out of scope for this pass.
+* **Custom-field auto-create**: `_ensure_custom_fields` runs on first
+  call against `ipam.vlan` to install the `nc_source` field
+  (`object_types: ["ipam.vlan"]`, text, non-required, loose filter).
+  Tries the NetBox 4.x `object_types` schema first and falls back to
+  legacy `content_types` on a 400/422 so the same code works against
+  NetBox 3.x and 4.x clusters.
+* **Returns**: `(report, vlan_map)` where
+  `vlan_map[(site_id, vid)] = nb_vlan_id`; the interface pass uses
+  this map to resolve `untagged_vlan` / `tagged_vlans` references.
+
+**Phase 3 — `reconcile_interfaces` extended (create + patch existing)**
+
+- **Custom-field auto-create**: at pass start, ensures six new
+  `dcim.interface` custom fields exist in the `nc_*` namespace
+  (`nc_stp_portfast`, `nc_stp_bpdu_guard`, `nc_stp_bpdu_filter`,
+  `nc_stp_root_guard`, `nc_stp_loop_guard`, `nc_voice_vlan`).
+- **`_graph_interfaces()` query extended**: also returns the new
+  per-port properties plus the parent device's `netbox_site_slug` so
+  the interface pass can resolve VLAN ids via the vlan_map (which is
+  keyed by `(site_id, vid)`). Device-prefetch loop also captures the
+  NetBox `site.id` for each parent device.
+- **CREATE path** (new interfaces) now includes:
+  * Native NetBox fields: `enabled`, `mode` (`access` / `tagged` /
+    `tagged-all`), `untagged_vlan`, `tagged_vlans` (lists of NetBox
+    vlan ids resolved via the vlan_map).
+  * Custom fields: `nc_voice_vlan`, `nc_stp_portfast`,
+    `nc_stp_bpdu_guard`, `nc_stp_bpdu_filter`, `nc_stp_root_guard`,
+    `nc_stp_loop_guard`. Only stamped when the source actually
+    provided a value (so missing PortFast info doesn't write `False`
+    over an operator-set `True`).
+  * Meraki's `allowedVlans = "all"` collapses to NetBox
+    `mode = tagged-all` (no explicit list). A concrete allow-list
+    collapses to `mode = tagged`. Both NetBox modes still set
+    `untagged_vlan` to the native VLAN id when present.
+- **PATCH-existing path (new in dev62, `_build_iface_l2_patch`)**:
+  Instead of silently skipping existing interfaces, the writeback now
+  computes a minimal PATCH body and updates them, with conservative
+  per-field rules:
+  * **Native NetBox fields** (`enabled`, `mode`, `untagged_vlan`,
+    `tagged_vlans`) — patched ONLY when the current NetBox value is
+    blank (None / empty / no tagged VLANs). Operator-set values are
+    preserved.
+  * **`nc_*` custom fields + `meraki_*`** — owned by netcortex
+    outright; always patched when the source value differs from
+    what's in NetBox.
+  * Returns an empty dict (and the writeback skips the API call) when
+    there's nothing to change, so steady-state runs make zero API
+    writes for interfaces that haven't changed.
+- New per-cycle counter `interfaces_l2_patched` surfaces in
+  `reconcile_to_netbox`'s summary so the operator can see how much
+  L2/STP enrichment landed.
+
+**Operator-visible outcome (post-deploy verification)**
+
+After the dev62 deploy:
+* Open `/dcim/interfaces/?device_id=<switch>` in NetBox; the new STP
+  custom-field columns (`nc_stp_*`) appear at the bottom of each
+  interface detail page, and `mode` / `untagged_vlan` / `tagged_vlans`
+  show populated values on every port the source provided.
+* Open `/ipam/vlans/?site=<site_slug>`; the per-site VLAN inventory now
+  matches the Meraki Dashboard / Cisco running-config (or the
+  intersection thereof). Operator-authored VLANs are left untouched
+  and netcortex-authored ones carry `nc_source = meraki-vlan` /
+  `snmp-vlan` so they're easy to filter or bulk-edit.
+
+### Fixed (dev61) — duplicate Interface nodes per Meraki port
+Operator opened the Explorer for `cpn-nash-ms130-1` (an MS130-12X — 12
+copper + 2 SFP = 14 ports) and saw **28 interfaces** instead of 14.
+Every port appeared twice — once as `meraki-if:Q4CD-Y6FW-EKVS:N`
+(source `meraki/CPN`, sourced from the Meraki Dashboard API) and once
+as `snmp-if:meraki:Q4CD-Y6FW-EKVS:Port N` (source `snmp/default`,
+sourced from a direct SNMP poll over Tailscale CGNAT). Both nodes were
+attached via `HAS_INTERFACE`, so the explorer's
+`(d)-[:HAS_INTERFACE]->(i)` query returned both.
+
+Root cause: two adapters can legitimately produce Interface nodes for
+the same physical port on the same device. The Meraki adapter emits
+one keyed by the Dashboard API `portId` (used by webhook → API
+write-back to push port config changes back). The SNMP adapter emits
+another keyed by the IF-MIB `ifName`. Until now nothing in the
+correlator merged them, so:
+
+* The Explorer showed 2× the real port count.
+* Cable / link decorators sometimes picked the inactive (`snmp-if`)
+  shadow when the meraki-if was authoritative, and vice versa.
+* Stale `snmp-if:` Interface nodes from older polling cycles (different
+  `dev_node_id` or removed device) piled up unreachable —
+  2,317 orphans in this environment.
+
+- **New helper `_pick_iface_winner(platform, candidates)`**:
+  platform-aware priority picker.
+    * Meraki devices → `meraki-if:` wins (keeps the Dashboard port_id
+      that webhook write-back needs).
+    * Cisco-style devices (IOS / IOS-XE / NX-OS / IOS-XR / ASA / FTD)
+      → `snmp-if:` wins (SNMP IF-MIB is the authoritative live-port
+      catalog; CatC and NDFC just re-export it).
+    * Everything else → the default priority list (`te`, `meraki`,
+      `fmc`, `ndfc`, `catc`, `snmp`).
+  Ties within the same bucket broken by freshest `last_seen`, then by
+  lex order on `id` for full determinism.
+
+- **New correlator pass `_merge_duplicate_interfaces_per_device`**:
+  groups every `HAS_INTERFACE`-attached Interface per
+  `(device_id, name_canonical)` (falling back to `name` for ports that
+  the canonical normalizer doesn't rewrite — e.g. Meraki "Port 1").
+  For each group of 2+ interfaces:
+    1. Picks a winner via the helper above.
+    2. Copies non-null properties from each loser onto the winner where
+       the winner has none, keeps the freshest `last_seen` / oldest
+       `first_seen`, and records the loser's `source_adapter` in a
+       new `merged_sources` list so the Explorer can answer "where did
+       this port actually come from?".
+    3. Re-points the loser's outbound relationships
+       (`LEARNED_MAC` / `HAS_ARP` / `ASSIGNED_IP` / `STP_LINK` /
+       `LOGICAL_MEMBER` / `TAGGED` / `UNTAGGED` / `HAS_PREFIX`) onto
+       the winner with `MERGE` so we don't create parallel edges.
+    4. `DETACH DELETE`s the loser (drops the redundant HAS_INTERFACE
+       edge plus any rel type we didn't explicitly re-point).
+  Idempotent — a clean graph yields zero merges.
+
+- **New correlator pass `_purge_orphan_interfaces`**: deletes Interface
+  nodes that no Device claims via `HAS_INTERFACE` AND whose `last_seen`
+  is older than 1 hour. Cleans up the 2,317 stale `snmp-if:` orphans
+  carried over from previous polling cycles where the Device's
+  `mgmt_ip` keyed a different node id than the current Meraki-keyed
+  Device.
+
+- **Wired both passes into `run_correlation`** right after
+  `_populate_interface_canonical_names` and before any downstream
+  L2 / STP / L3 decorator — so the decorators always see one canonical
+  Interface per (device, port). New counters `iface_dups_merged` and
+  `iface_orphans_purged` surface in the per-cycle log line.
+
+### Observed-but-not-changed (dev61) — Meraki cloud SNMP for CPN org is blocked
+While investigating the above, the worker logs revealed that cloud SNMP
+polling for the **CPN** Meraki org is being silently rejected by the
+Meraki Dashboard: `cloud_devices_seen=0` every cycle, with a warning
+that our outbound IP `192.133.160.84` is **not** in the configured
+`peerIps` allow-list (`199.66.188.132`, `73.238.75.37`, `208.86.66.31`,
+`100.101.4.62`). The **CPNGOV** org has `peerIps` unrestricted and
+returns ~170 devices per cycle (149 marked as cloud-covered).
+
+This explains the user's perception that "SNMP can't get port info" for
+Meraki devices: the operator-visible `snmp_health=unreachable` pill on
+CPN Meraki devices comes from the direct SNMP path occasionally
+flapping over the Tailscale 100/8 CGNAT tunnel, and there's no working
+cloud fallback to mask the flap.
+
+**Workaround** (operator action, not a code change): add the worker's
+outbound IP `192.133.160.84` to the CPN org's SNMP peerIps in the
+Meraki Dashboard (Organization → Settings → SNMP). Once that's done,
+cloud SNMP will start returning data and the device-level
+`snmp_health` flag will settle on `cloud_only` instead of
+`unreachable` even when the direct poll happens to fail.
+
+## [Unreleased — 0.6.0-dev60]
+
+### Fixed (dev60) — duplicate Meraki-network site collisions cleaned up
+Operator observed two NetBox sites (`cpn-gov-aaday` and
+`cpn-gov-aaday-Meraki-Demo-Day`) showing the exact same four devices.
+Investigation traced this to ten NetBox site pairs whose
+`custom_fields.meraki_networks` arrays both listed the same Meraki
+`network_id`, e.g.:
+
+```
+site 45 cpn-gov-aaday                    → [{id: L_1155173304420547759, ...}]
+site 56 cpn-gov-aaday-Meraki-Demo-Day    → [{id: L_1155173304420547759, ...}]
+```
+
+The `meraki_networks` field is the authoritative N:1 map (many Meraki
+networks → 1 NetBox site).  Listing the same `network_id` under two
+sites duplicates every device once per site (~40 stale records across
+the ten collisions in this environment).  The read side
+(`enrich_sites_from_netbox`) already logged a `WARNING` per collision
+and refused to map either side, but nothing actively cleaned up the
+duplicates in NetBox — so the symptom persisted every time the UI
+listed devices by site.
+
+- **New helper `_pick_winner_for_meraki_collision(network_id, sites)`**:
+  deterministic winner picker with a four-step ladder
+  (inner-name match → drop `-Meraki-Demo-Day` suffix → both →
+  shortest-name + lex + id tiebreak).  Always picks the same
+  winner across re-runs.
+
+- **New pass `reconcile_duplicate_meraki_sites`**: pages
+  `dcim.site`, buckets by Meraki `network_id`, and for every
+  collision:
+    1. picks a winner via the helper above,
+    2. fetches both sides' devices, deletes every loser device whose
+       serial collides with a winner device (cascades interfaces, IPs,
+       cables),
+    3. PATCHes the loser's `meraki_networks` custom field to remove
+       just the colliding entry so the collision stops firing every
+       poll cycle.
+  Loser devices with no serial, or with a serial unique to the loser
+  side, are intentionally **left alone** (we can't safely call those
+  duplicates without a definitive id match).  The loser site itself
+  is **not** deleted — that's still an operator decision.
+
+- **Wired as Pass 0a** in `reconcile_to_netbox`, ahead of device
+  creates, so later passes never operate on the duplicated rows
+  during the same run.
+
+- **Counters**: new top-level `site_collisions` block in the report,
+  plus `collisions_resolved`, `duplicate_devices_deleted`, and
+  `loser_sites_cleared` in the summary.  Idempotent: a clean
+  environment yields zeroes on every field.
+
+---
+
+## [Unreleased — 0.6.0-dev59]
+
+### Fixed (dev59) — surgical rename of operator-style `VLAN-N` SVIs
+Operator observed that even after dev58, `cpn-ful-cat9k1` showed two
+naming conventions side by side: `Vl1`/`Vl11`-`Vl16`/`Vl80` (Cisco
+short form, with IPs) and `VLAN-10`/`VLAN-1002`-`1005` (operator/
+legacy import).  The dev58 dedupe pass only removed pure duplicates
+(`VLAN-1` next to `Vl1`); the orphan `VLAN-N` entries (no `Vl{N}`
+counterpart) were left in place.
+
+- **New helper `_canonical_short_name(name)`**: title-cases the
+  recognised Cisco short prefix and preserves the suffix.  Only
+  rewrites when the resulting prefix is a known Cisco short
+  (`Vl`, `Gi`, `Te`, `Twe`, `Po`, `Lo`, `Tu`, `Fa`, `Eth`, `Hu`,
+  `Fo`, `Fi`, `Tw`, `Ma`, `BV`, `BD`) — generic names (`Port 1`,
+  `wan1`, `MGMT`, operator labels) are left untouched.
+- **`reconcile_interface_naming` gained a Part 0.5 rename pass**,
+  intentionally NARROW in scope.  Only NetBox interface names
+  matching the regex `^VLAN-\d+$` (all-caps + hyphen + digits) are
+  rewritten — this is the *demonstrably non-canonical*
+  operator/import style; Cisco platforms never emit it natively.
+  The rewrite goes to the short form (`VLAN-10` → `Vl10`,
+  `VLAN-1002` → `Vl1002`).
+  * **Platform-native long forms are explicitly preserved.**
+    `GigabitEthernet0/0/1` (IOS-XE running-config canonical),
+    `Ethernet1/1` (NX-OS / UCS canonical), `TenGigabitEthernet1/0/1`,
+    `Port 1` (Meraki MS), `wan1` (Meraki MX) — all left untouched.
+  * Collisions tracked by an in-memory `live_names` set, updated
+    as renames apply within the run so chained renames don't step
+    on each other.  On collision (the canonical target already
+    exists), the rename is skipped with reason
+    `rename_target_exists`; next run's dedupe pass resolves it.
+- **`reconcile_interfaces` writes the SNMP-/API-provided name
+  AS-IS** (reverted the unconditional canonicalization from earlier
+  in this dev cycle).  Platforms that report `Ethernet1/1`
+  (NX-OS / UCS) or `GigabitEthernet0/0/1` (IOS-XE running-config)
+  now land in NetBox with those exact names.
+- **Live result on this environment**:
+  * `cpn-ful-cat9k1`: `VLAN-10` → `Vl10`, `VLAN-1002` → `Vl1002`,
+    `VLAN-1003` → `Vl1003`, `VLAN-1004` → `Vl1004`, `VLAN-1005` →
+    `Vl1005`.  Device now reads as one consistent set of Vl* SVIs.
+  * Same pattern wherever else operator-imported `VLAN-N` entries
+    existed.  All other interface names unchanged.
+
+## [Unreleased — 0.6.0-dev58]
+
+### Fixed (dev58) — virtual interfaces, virtual-endpoint cables, dedupe
+Follow-up to the dev57 cable-label fix; operator reported that
+`cpn-ful-cat9k1` still showed duplicate VLAN entries (`Vl1` and
+`VLAN-1`, `Vl11` and `VLAN-11`, ...), an orphan `wan1` interface, an
+`nc-cable-` prefix that was uglier than necessary, and that the cable
+that survived on the SVI side should be typed `virtual` rather than
+the default (None).
+
+**Important discovery during implementation**: NetBox cables model
+strictly **physical** connections — the only valid `type` values are
+copper (cat3-cat8), fiber (mmf/smf), DAC, coax, power, USB.  There is
+**no `virtual` type**.  A cable whose endpoint is a Vlan SVI, Port-
+channel, Loopback, Tunnel, or BVI/BDI is a CDP/LLDP discovery artifact
+(the responder resolved its peer by management IP — which lives on a
+Vlan — instead of by direct port observation), so it doesn't reflect
+real wiring.  Rather than try to crowbar a "virtual" type into NetBox,
+we now **delete** those cables.
+
+- **Cable label simplified**: `nc-cable-{id}` → `cable-{id}` (POST
+  + PATCH on cable create, and backfill of existing 38 cables already
+  bearing the `nc-cable-` form).  `reconcile_cable_labels` now
+  recognises *both* legacy forms (`cdp`/`lldp`/... and
+  `nc-cable-NNN`) and migrates each to `cable-{id}` idempotently.
+- **Virtual-endpoint cables now SKIPPED at POST and DELETED at
+  hygiene time**: `reconcile_cables` filters out any link where either
+  endpoint name is virtual (Vlan SVI / Port-channel / Loopback /
+  Tunnel / BVI / Null) with reason `virtual_endpoint_filtered`.
+  `reconcile_cable_labels` enumerates existing cables and DELETEs any
+  whose endpoints include a virtual interface (counted as
+  `virtual_deleted` in the report).  This wipes out the
+  CDP-on-management-IP discovery noise (e.g. the `VLAN-1 ↔ Gi0/0/1`
+  cable between cpn-ful-cat9k1 and cpn-ful-cat8k2).
+- **`_nb_iface_type(speed, name)` is now name-aware**: when called
+  with a virtual-style name (Vlan/Vl + N, Port-channel/Po + N,
+  Loopback/Lo + N, Tunnel/Tu + N, BVI/BV + N, BDI/BD + N, Null + N)
+  it returns `"virtual"` regardless of the speed SNMP reported.
+  Fixes the case where ifTable inherits the underlying physical
+  link's speed onto a Vlan SVI and the reconciler mis-types it as
+  `1000base-t`.
+- **New helper `_is_virtual_iface_name`** drives both the iface-type
+  decision and the cable-type decision so the two stay in sync.
+- **New helper `_is_mx_wan_style_iface_name`** matches Meraki MX
+  uplink labels (`wan1`, `wan2`, ...).
+- **`_is_wrong_platform_iface_name`** is the union of
+  `_is_meraki_style_iface_name` and `_is_mx_wan_style_iface_name`,
+  used by the cleanup pass.
+- **`reconcile_interface_naming` gained two new responsibilities**:
+    * **Normalization-collision dedupe**: when a device has two NetBox
+      interface records that normalize to the same canonical key
+      (e.g. `Vl1` and `VLAN-1`), pick a winner — preferring entries
+      with IPs > cables > platform-preferred-source backing > shorter
+      name > older id — and:
+        * If loser has no IPs and no cable → delete it.
+        * If loser is cabled and the winner is physical and uncabled
+          → PATCH the cable to re-terminate on the winner, then
+          delete the loser.
+        * If loser is cabled and the winner is virtual → leave the
+          cable alone (it'll be deleted by the cable-hygiene pass on
+          this run, since virtual-endpoint cables are no longer
+          retained), then delete the loser.
+        * If loser has IPs → log and skip (operator review).
+        * If both are cabled → log and skip.
+    * **Iface-type patch**: when a virtual-named interface in NetBox
+      has type ≠ `virtual` (commonly `1000base-t` or `other` from
+      legacy reconciler runs), PATCH it to `virtual`.
+- **Wrong-platform delete extended**: also catches `wan1`/`wan2`-style
+  names on non-Meraki devices (was only catching `Port N`).
+- **Live cleanup results on this environment** (after correcting the
+  cable type discovery → delete approach):
+    * 38 cables relabelled `nc-cable-N` → `cable-N`.
+    * Virtual-endpoint cables deleted (cable-123 on
+      `cpn-ful-cat9k1:VLAN-1 ↔ cpn-ful-cat8k2:Gi0/0/1`).
+    * VLAN dedupe — `VLAN-1` on `cpn-ful-cat9k1` deleted (winner is
+      `Vl1`); orphan `VLAN-10/1002/1003/1004/1005` left alone
+      (no `Vl*` counterpart so they're not duplicates — operator
+      cleanup needed if desired).
+    * `wan1` deleted across 6 non-Meraki devices (operator entries
+      from 2024-11-14).
+    * `Vl1`, `Vl11`, `Vl12`, ..., `Vl80` patched from
+      `1000base-t` → `virtual`; `VLAN-*`, `Port-channel*` patched
+      from `other`/`25gbase-x-sfp28` → `virtual`.
+
+## [Unreleased — 0.6.0-dev57]
+
+### Fixed (dev57) — cable records visible in NetBox connection columns
+- **Problem.** Operators couldn't tell whether the reconciler was
+  actually creating NetBox **cable records** for discovered links.
+  When viewing an interface like `cpn-ful-cat8k1 GigabitEthernet0/0/1`
+  the connection column rendered as ``cdp <peer-device> <peer-port>``,
+  with no cable identifier — looking like a free-text annotation
+  rather than a real cable.
+- **Root cause.** `reconcile_cables` was stamping the discovery
+  protocol (`cdp`, `lldp`, `catc_topology`, `mac_arp`) into the
+  cable's ``label`` field.  NetBox renders ``label`` (when set) in
+  every connection display *instead of* the auto-assigned cable ID,
+  so the cable ID was hidden.  The cable records *were* being
+  created (156 of them at the time of the report) — they just looked
+  invisible from the UI.
+- **Fix in `reconcile_cables`**:
+    * Cable POST now omits ``label`` and sets
+      ``description = "auto-created via netcortex (source: <proto>)"``.
+    * After NetBox assigns an ID, a follow-up PATCH stamps
+      ``label = f"nc-cable-{cable_id}"`` so the operator sees
+      ``nc-cable-158`` (or similar) in every connection column —
+      proving the cable exists and giving the clickable ID.
+    * `entry["nb_cable_id"]` is now returned in the change list so
+      external tooling can correlate created cables.
+- **New pass `reconcile_cable_labels` (5b)** — backfill for the
+  existing 156 cables.  Migrates every cable whose label is one of
+  the legacy protocol tokens (``cdp``, ``lldp``, ``catc_topology``,
+  ``mac_arp``, ``discovered``) to:
+    * ``label = nc-cable-{id}``
+    * ``description = "auto-created via netcortex (source: <proto>)"``
+      (only when description was empty — never clobber operator notes).
+  Cables with any other label (operator-created or third-party tooling)
+  are left untouched.  Runs every reconcile cycle, idempotent.
+- **Orchestrator `reconcile_to_netbox`**: inserts pass 5b between
+  cable create (pass 5) and iface-naming hygiene (pass 6); summary
+  gains ``cable_labels_patched`` counter and full per-cable diff is
+  available under the ``cable_labels`` key.
+
+## [Unreleased — 0.6.0-dev56]
+
+### Added (dev56) — platform-aware interface reconciliation
+- **Platform-source filter in `reconcile_interfaces`**.  A Cisco IOS-XE
+  switch enrolled in Meraki Dashboard ends up with both
+  `snmp-if:meraki:<serial>:<ifname>` and `meraki-if:<serial>:<port_id>`
+  Interface nodes on the same canonical Device.  The reconciler now
+  picks the source whose naming convention matches the NetBox
+  device-type model:
+    * `device_type.model` starts with MS/MR/MX/MV/MT/MG/CW
+      → use `meraki-if:*` (Meraki Dashboard ports — carry `port_id` for
+      webhook sync); enrich `speed_mbps` from the sibling `snmp-if:*`
+      record when the Meraki API didn't report a speed.
+    * Any other device (Cisco IOS, Nexus, ...)
+      → use `snmp-if:*` (real OS-native names like `Te1/0/27`,
+      `Twe1/1/4`, `Vl13`).  Meraki-source rows are skipped with
+      `wrong_source_for_non_meraki_device`.
+- **`meraki_port_id` custom-field stamping**.  When creating or
+  updating a Meraki-OS interface, the reconciler now sets
+  `custom_fields.meraki_port_id` to the Meraki API's port ID, plus
+  `meraki_serial` (parent device serial), `nc_platform`
+  (adapter source — e.g. `"meraki-if"`), and `nc_platform_id`
+  (mirror of port_id).  The `meraki_port_id` field is the hook that
+  lets a NetBox webhook call back into the Meraki Dashboard API on
+  interface changes.
+- **New write-back pass `reconcile_interface_naming`** (Pass 6,
+  runs after cables).  Two responsibilities:
+    * **Delete wrong-platform interfaces** — On non-Meraki devices,
+      DELETE any NetBox interface whose name matches the Meraki
+      dashboard pattern (`Port 1`, `Port1_C9300X-NM-8Y_7`, `port-2`,
+      `Port 1::C9300x-NM-8Y::1`, ...) provided:
+        - the interface is **not cabled**, AND
+        - the interface has **no IP addresses assigned**, AND
+        - no platform-native graph interface uses the same canonical
+          key (defence-in-depth — never delete the operator's intent).
+      This finally cleans up the 344 pre-existing Meraki-style entries
+      operators left on Catalysts back in 2024.
+    * **Backfill `meraki_port_id` and friends** — For every existing
+      NetBox interface on a Meraki-OS device, PATCH the four
+      custom fields when the graph value differs from NetBox.  These
+      are computed values (not operator-maintained) so the reconciler
+      always syncs them to the graph.
+
+### Changed (dev56)
+- `_graph_interfaces` Cypher now returns `iface_id` and `port_id`
+  alongside the existing columns.  New helper `_iface_source(iface_id)`
+  derives the adapter source from the node-id prefix.
+- `reconcile_to_netbox` pass order documented: 0 devices → 1 serials
+  → 2 interfaces → 3 IPs → 4 IP assignments → 5 cables → **6 iface
+  naming (new)** → 7 analysis.  Summary report gains `ifaces_deleted`
+  and `ifaces_cf_patched` counters.
+
+### Outstanding (still out of scope)
+- **Adapter-twin canonicalization**.  When the same physical box is
+  observed by multiple adapters (e.g. an LLDP-discovered stub for a
+  Cisco switch behind a Meraki cloud-managed Catalyst), the current
+  `_ADAPTER_PRIORITY` ranks Meraki above SNMP/discovered stubs.  The
+  dev56 source filter sidesteps the naming consequences of this, but
+  the priority list itself is unchanged.  A model-aware priority
+  (e.g. SNMP wins for Cisco device-types when SNMP polled the device
+  directly) is the proper structural fix and remains a follow-up.
+
+## [Unreleased — 0.6.0-dev55]
+
+### Fixed (dev55) — interface reconciler hardening after dev51 damage
+Three serious bugs in `reconcile_interfaces` were discovered after the
+first WET run (dev51) created **1,118 bad interface rows** across the
+NetBox instance:
+
+- **526 garbage Meraki-style names on Cisco IOS devices**
+  (cpn-ash-cat9k1, cpn-ful-cat9k1, cpn-irvine-c9300, e3, e4,
+  Q5TF-D7RF-DQ5E, ba-swt9300-1).  Root cause: several Cisco IOS-XE
+  switches are also enrolled in Meraki Dashboard.  The graph carries
+  two Device twins for each — a Cisco-IOS twin (`stub=True`) and a
+  Meraki twin (`canonical_id=None`).  The reconciler's
+  `WHERE d.stub IS NULL OR d.stub = false` clause excludes the
+  Cisco-IOS twin and picks the Meraki one, whose interface labels are
+  Meraki dashboard names like `Port 1_C9300X-NM-8Y_7`.  Those got
+  pushed onto the NetBox C9300 records where they have no meaning.
+- **592 normalization-collision duplicates** on Meraki MS switches.
+  Root cause: graph reports interfaces as `Port 1` (with space) while
+  NetBox had operator-entered `Port1` (no space).  The reconciler's
+  existing-interface check was `lowercase exact match`, so the two
+  forms were treated as distinct and dupes were created.  Same class
+  of bug for Cisco short / long form: `Twe1/1/1` vs
+  `TwentyFiveGigE1/1/1`.
+- **mGig (2.5G / 5G) ports mis-typed as `1000base-t`** on MS130-series
+  switches.  Root cause: `_nb_iface_type` had no 2.5G / 5G buckets, so
+  `speed_mbps=2500` fell into the `>= 1000` bucket and got
+  `1000base-t`.
+
+Code fixes:
+- `_nb_iface_type` now includes `2.5gbase-t` and `5gbase-t` tiers.
+- New `_normalize_iface_name` collapses whitespace, lowercases, and
+  maps Cisco IOS long-form prefixes (`TwentyFiveGigE`, `TenGigabitEthernet`,
+  `GigabitEthernet`, `Port-channel`, `Vlan`, ...) to their short form.
+- `_fetch_nb_interface_map` keys interfaces by the canonical normalized
+  name and surfaces in-NetBox collisions as warnings.
+- `reconcile_interfaces` uses the canonical key for the
+  "does this interface already exist?" membership check.
+- `reconcile_interfaces` adds a new quality gate
+  `meraki_naming_on_non_meraki_device` that refuses to push `Port N`
+  style names to NetBox devices whose `device_type.model` does not
+  start with a Meraki prefix (MS / MR / MX / MV / MT / MG / CW).  This
+  is a defensive guard until the canonicalization is fixed to prefer
+  the Cisco-IOS twin for IOS devices.
+- `reconcile_ip_addresses`, `reconcile_ip_assignments`, and
+  `reconcile_cables` all switched to `_normalize_iface_name` when
+  resolving interface IDs from the iface map.
+
+Cleanup (one-off): **1,185 bad interfaces** were deleted from NetBox
+across four passes (all uncabled, no IPs):
+  - 526 `Port N` Meraki labels on Cisco IOS devices
+  - 592 `Port 1` ↔ `Port1` whitespace-collision duplicates on Meraki MS
+  - 56 secondary garbage caught by the improved regex (`port-2`,
+    `Port 1::C9300x-NM-8Y::1` etc.) and improved normalization
+    (`VLAN-13` ↔ `Vl13`)
+  - 11 intra-batch duplicates where dev51 created both forms
+    (`VLAN-1` and `Vl1`) for the same logical interface
+
+60 mGig interfaces had their `type` field PATCH'd from `1000base-t`
+to `2.5gbase-t` (the missing speed-tier bug).
+
+Final NetBox interface counts on the previously broken devices:
+  - cpn-ash-cat9k1:  220 → 155
+  - cpn-ful-cat9k1:  229 → 158
+  - cpn-irvine-c9300: 197 → 99
+  - cpn-nash-ms130-1:  29 → 15
+
+Dry-run of the dev55 reconciler against the cleaned NetBox state
+returns `would_create=0`, `quality_filtered=538` (the previously bad
+names are now correctly classified and refused at write-time):
+```
+skip_reasons:
+  already_exists:                    1435
+  meraki_naming_on_non_meraki_device: 534
+  placeholder_name:                     4
+```
+
+### Outstanding (out of scope for dev55)
+- **Canonicalization bug**: `enrich_devices_from_netbox` should
+  prefer the Cisco-IOS twin over the Meraki twin for IOS-managed
+  switches that are also enrolled in Meraki Dashboard.  The dev55
+  quality gate is a defensive net under the reconciler; the proper
+  fix is upstream in adapter / canonicalization logic.
+
+## [Unreleased — 0.6.0-dev54]
+
+### Added (dev54)
+- **NetBox device-create pass** (`netcortex/sync/netbox_writeback.py::reconcile_devices_create`).
+  Adds devices the graph has discovered but NetBox doesn't yet know about
+  (the 131 "absent_in_netbox" devices currently surfaced in the analysis
+  report).  Per operator policy, new devices use the platform-observed
+  ``Device.name`` verbatim; devices already in NetBox (matched by serial /
+  native ID via ``enrich_devices_from_netbox``) keep their NetBox name
+  untouched.  Site assignment comes from the ``meraki_networks`` custom
+  field mapping computed by ``enrich_sites_from_netbox``.  Devices whose
+  site / device-type / role can't be resolved are skipped with a
+  structured ``skip_reason`` so the operator sees exactly what needs to
+  exist in NetBox first (e.g. add the device-type or role and re-run).
+  Idempotent against ``400 "already exists"`` collisions.
+- **NetBox IP assignment-fill pass**
+  (`netcortex/sync/netbox_writeback.py::reconcile_ip_assignments`).
+  Attaches existing-but-unassigned NetBox IP records to their owning
+  interface when the graph knows the owner.  This directly resolves the
+  common "nmap-discovered, never assigned" case: a NetBox record like
+  ``192.133.178.1/19`` (unassigned, with nmap scan data in comments)
+  whose host the graph sees on ``cpn-ash-cat9k1 Vl13`` now gets PATCH'd
+  to that interface.  Never modifies the address or prefix length, and
+  never overwrites an existing assignment — NetBox stays authoritative
+  for intentional bindings.
+
+### Changed (dev54)
+- **Field-mismatch report no longer flags name divergences**
+  (`netcortex/sync/netbox_enrich.py::_compute_netbox_delta`,
+  `netcortex/sync/netbox_writeback.py::analyse_field_mismatches`).
+  Per operator policy, the platform-observed name (``Device.name``) and
+  the NetBox-authoritative display name (``Device.display_name``) are
+  *allowed* to differ — e.g. Meraki's ``"AP71 (78:0f:81:73:2a:70)"``
+  vs the NetBox-clean ``"ap71"``.  Only real data-integrity issues
+  (serial mismatch) appear in the report now, eliminating the constant
+  noise that made the analysis section unusable.  The function
+  ``analyse_site_mismatches`` was renamed to ``analyse_field_mismatches``
+  (the old name was misleading — it never reported site assignments) and
+  the old name is kept as a backward-compatible alias for one release.
+- **`reconcile_to_netbox` summary gained `devices_created` and
+  `ips_assigned` counters**, and pass order documentation was updated
+  to reflect the new pass 0 (device create) and pass 4 (IP assign).
+  Devices created in pass 0 land in NetBox immediately but won't have
+  their interfaces / IPs reconciled until the next worker enrich cycle
+  re-stamps ``netbox_id`` on the corresponding graph Device node.
+
+## [Unreleased — 0.6.0-dev53]
+
+### Fixed (dev53)
+- **NetBox IP create is now idempotent against global-table duplicates**
+  (`netcortex/sync/netbox_writeback.py::reconcile_ip_addresses`). NetBox
+  enforces host-IP uniqueness across all prefix lengths in the global
+  table: an attempt to create `192.133.178.1/32` when NetBox already has
+  `192.133.178.1/19` returned `400 "Duplicate IP address found in global
+  table"`, which dev52 surfaced as a failure (20/20 errors in the first
+  WET reconcile run). We now catch that specific 400 response, mark the
+  entry as `skipped` with reason `already_in_global_table`, add it to
+  the local existing-IP set so subsequent rows in the same run also
+  skip, and log it at INFO. Other 4xx/5xx still fail loudly with the
+  full NetBox response body included in the change record (previous code
+  swallowed the body and only kept the generic httpx message).
+
+### Fixed (dev52)
+- **NetBox reconciler quality gates** (`netcortex/sync/netbox_writeback.py`):
+  - `reconcile_interfaces` skips placeholder/unresolved interface names
+    (`unknown`, `(unknown)`, `?`, `n/a`, `none`, `null`, `-`, `<unknown>`) so
+    they never pollute NetBox inventory. Filtered count is reported in the
+    new `quality_filtered` field on the interface report and logged at INFO
+    as `netbox_writeback.interface.quality_filtered`.
+  - `reconcile_cables` skips PHYSICAL_LINK edges where both endpoints resolve
+    to the same NetBox device. These leak in from stale LLDP/CDP entries or
+    hairpin loopbacks and previously would create invalid self-loop cables in
+    NetBox. Filtered count is reported in the new `self_loops_filtered`
+    field on the cable report and logged at INFO as
+    `netbox_writeback.cable.self_loop_filtered`.
+  - The combined `quality_filtered` count is surfaced in the top-level
+    `reconcile_to_netbox()` summary alongside `total_changes` /
+    `total_errors`.
 
 ### Fixed (dev51)
 - **`make helm-upgrade` now reliably rolls pods to the new code** (`Makefile`).

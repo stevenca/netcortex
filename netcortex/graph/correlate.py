@@ -205,6 +205,27 @@ async def run_correlation() -> dict[str, int]:
     # canonical name populated FIRST or the JOIN will silently miss.
     canon_iface_names = await _populate_interface_canonical_names()
 
+    # Two adapters can produce parallel Interface nodes for the same
+    # physical port — e.g. the Meraki API emits
+    # ``meraki-if:Q4CD-Y6FW-EKVS:1`` and the (cloud or direct) SNMP
+    # poll emits ``snmp-if:meraki:Q4CD-Y6FW-EKVS:Port 1``. Both attach
+    # via HAS_INTERFACE, so the device appears to have double the
+    # interfaces in the Explorer and stale data flips between sources
+    # every cycle. Merge them down to ONE canonical Interface per
+    # (device, canonical_name) before any downstream decorator runs,
+    # so L2/STP/L3 decoration always finds a single, fully-merged
+    # endpoint to join against.
+    iface_dups_merged = await _merge_duplicate_interfaces_per_device()
+
+    # Some adapters historically left Interface nodes behind when the
+    # parent Device was renamed or removed (e.g. an SNMP poll keyed by
+    # mgmt_ip that briefly disagreed with a Meraki-keyed Device id).
+    # Those rows still hold real data but have no HAS_INTERFACE edge,
+    # so the Explorer can't reach them and they confuse cable / link
+    # joins.  Delete the ones that haven't been refreshed in over an
+    # hour so any in-flight ingest cycle has a chance to re-attach.
+    iface_orphans_purged = await _purge_orphan_interfaces()
+
     decorated_l2  = await _decorate_physical_links_l2()
     decorated_stp = await _decorate_physical_links_stp()
     decorated_l3  = await _decorate_physical_links_l3()
@@ -308,6 +329,8 @@ async def run_correlation() -> dict[str, int]:
              iface_names_normalized=norm_ifaces,
              links_enriched_with_health=enriched,
              iface_canonical_names_set=canon_iface_names,
+             iface_dups_merged=iface_dups_merged,
+             iface_orphans_purged=iface_orphans_purged,
              links_decorated_l2=decorated_l2,
              links_decorated_stp=decorated_stp,
              links_decorated_l3=decorated_l3,
@@ -339,6 +362,8 @@ async def run_correlation() -> dict[str, int]:
             "vlan_svis_linked": vlan_svis_linked,
             "vlan_labels_decorated": vlan_labels_decorated,
             "iface_canonical_names_set": canon_iface_names,
+            "iface_dups_merged": iface_dups_merged,
+            "iface_orphans_purged": iface_orphans_purged,
             "links_decorated_l2": decorated_l2,
             "links_decorated_stp": decorated_stp,
             "links_decorated_l3": decorated_l3,
@@ -1579,6 +1604,328 @@ async def _populate_interface_canonical_names() -> int:
     if updated:
         log.info("correlate.iface_canonical_names_set", count=updated)
     return updated
+
+
+# ── Interface deduplication ─────────────────────────────────────────────────
+#
+# Adapter-id prefix → which "kind" of Interface a node is. The merger uses
+# this to pick a canonical winner per (device, port) group.
+_IFACE_PREFIX_BY_KIND: dict[str, str] = {
+    "meraki-if": "meraki",
+    "snmp-if":   "snmp",
+    "catc-if":   "catc",
+    "ndfc-if":   "ndfc",
+    "fmc-if":    "fmc",
+    "te-if":     "te",
+}
+
+# Per-device-platform interface-source priority. Higher index = preferred
+# winner when multiple Interface nodes exist for the same physical port.
+#
+# Rationale:
+#   * Meraki devices: ``meraki-if:`` wins because its id maps to the Meraki
+#     Dashboard port_id, which is what the webhook → API write-back path
+#     uses to push port-config changes back to Meraki. Losing that id by
+#     promoting the SNMP-sourced shadow would silently break the round-trip.
+#   * Cisco-style devices (IOS/IOS-XE/NX-OS/ASA, also when ``platform`` is
+#     empty/unknown): ``snmp-if:`` wins because SNMP IF-MIB is the
+#     authoritative live-port catalog for those platforms (Catalyst Center
+#     and NDFC merely re-export it).
+#   * The catch-all "default" priority covers anything outside those buckets
+#     (rare). Whichever node has the freshest ``last_seen`` wins the
+#     tie-break inside the same priority bucket.
+_PLATFORM_IFACE_PRIORITY: dict[str, list[str]] = {
+    "meraki":  ["te", "fmc", "ndfc", "catc", "snmp", "meraki"],
+    # All Cisco-style platforms — SNMP is authoritative.
+    "ios":     ["te", "fmc", "meraki", "ndfc", "catc", "snmp"],
+    "iosxe":   ["te", "fmc", "meraki", "ndfc", "catc", "snmp"],
+    "ios-xe":  ["te", "fmc", "meraki", "ndfc", "catc", "snmp"],
+    "nxos":    ["te", "fmc", "meraki", "ndfc", "catc", "snmp"],
+    "nx-os":   ["te", "fmc", "meraki", "ndfc", "catc", "snmp"],
+    "iosxr":   ["te", "fmc", "meraki", "ndfc", "catc", "snmp"],
+    "ios-xr":  ["te", "fmc", "meraki", "ndfc", "catc", "snmp"],
+    "asa":     ["te", "fmc", "meraki", "ndfc", "catc", "snmp"],
+    "ftd":     ["te", "meraki", "ndfc", "catc", "snmp", "fmc"],
+}
+_DEFAULT_IFACE_PRIORITY: list[str] = [
+    "te", "meraki", "fmc", "ndfc", "catc", "snmp",
+]
+
+# Iface properties that the merger must NEVER copy across nodes — the
+# winner already owns its own identity and provenance, and the loser's
+# values would lie about where the surviving node came from.
+_IFACE_NON_MERGEABLE_KEYS: set[str] = {
+    "id", "_content_hash", "source_adapter",
+}
+
+
+def _iface_prefix(node_id: str | None) -> str:
+    """Return the ``meraki-if`` / ``snmp-if`` / etc. prefix of an Interface id."""
+    if not node_id or ":" not in node_id:
+        return ""
+    return node_id.split(":", 1)[0]
+
+
+def _iface_kind(node_id: str | None) -> str:
+    """Return the source-kind ('meraki', 'snmp', …) for an Interface id."""
+    return _IFACE_PREFIX_BY_KIND.get(_iface_prefix(node_id), "")
+
+
+def _pick_iface_winner(
+    platform: str | None,
+    candidates: list[dict],
+) -> tuple[dict, list[dict]]:
+    """Return ``(winner, losers)`` for one (device, name) duplicate group.
+
+    Candidates are dicts with at least ``id`` and ``last_seen`` keys. The
+    priority list for the device's platform is consulted first; the freshest
+    ``last_seen`` breaks ties within the same source-kind bucket.
+    """
+    plat = (platform or "").lower().strip()
+    priority = _PLATFORM_IFACE_PRIORITY.get(plat, _DEFAULT_IFACE_PRIORITY)
+
+    def _score(entry: dict) -> tuple[int, float, str]:
+        kind = _iface_kind(entry.get("id"))
+        try:
+            rank = priority.index(kind) if kind else -1
+        except ValueError:
+            rank = -1
+        last_seen = entry.get("last_seen") or 0.0
+        try:
+            last_seen_f = float(last_seen)
+        except (TypeError, ValueError):
+            last_seen_f = 0.0
+        # Final lexical tiebreak on id so the choice is fully deterministic
+        # across runs even if scores happen to be identical.
+        return (rank, last_seen_f, str(entry.get("id") or ""))
+
+    ranked = sorted(candidates, key=_score, reverse=True)
+    return ranked[0], ranked[1:]
+
+
+async def _merge_duplicate_interfaces_per_device() -> int:
+    """Merge parallel Interface nodes for the same physical port.
+
+    Two adapters routinely produce Interface nodes for the same port on
+    the same device. The canonical example is a Meraki MS switch that the
+    Meraki adapter emits as ``meraki-if:<serial>:<port_id>`` (with port-id
+    matching the Dashboard API) AND the SNMP adapter emits as
+    ``snmp-if:meraki:<serial>:Port <N>`` (sourced from the cloud or direct
+    SNMP poll). Both attach via HAS_INTERFACE, so the Explorer shows 2× the
+    real port count and stale data flips between sources every cycle.
+
+    This pass:
+      1. Groups every HAS_INTERFACE-attached Interface per
+         ``(device_id, name_canonical)`` (falling back to ``name`` for ports
+         whose canonical name wasn't set — e.g. Meraki "Port 1" which has
+         no Cisco-style prefix).
+      2. For each group of 2+ Interface nodes, picks a canonical winner
+         using ``_pick_iface_winner`` (platform-aware priority list +
+         last_seen tiebreak).
+      3. Copies non-null properties from each loser onto the winner where
+         the winner has no value, and keeps the freshest ``last_seen`` /
+         oldest ``first_seen``.
+      4. Re-points the loser's outbound relationships
+         (LEARNED_MAC / HAS_ARP / ASSIGNED_IP / STP_LINK / LOGICAL_MEMBER /
+         TAGGED / UNTAGGED) onto the winner, MERGE-deduplicating so we
+         don't create parallel edges.
+      5. DETACH DELETEs the loser (drops the redundant HAS_INTERFACE edge
+         and the orphaned Interface node).
+
+    Idempotent — a clean graph yields zero merges. Safe to run every cycle.
+    """
+    driver = get_driver()
+    merged = 0
+    groups_seen = 0
+    pairs: list[tuple[str, str]] = []
+
+    async with driver.session() as session:
+        # Step 1: find duplicate groups. Bucket by (device, canonical_name).
+        # We pull just enough metadata to pick a winner locally, then issue
+        # bulk re-point / delete queries against the resulting (win, lose)
+        # pairs. ``head(coalesce(...))`` keeps the query schema-safe even
+        # if some Interface nodes are missing first_seen / last_seen
+        # entirely (zero is treated as "oldest" / "never seen").
+        res = await session.run(
+            """
+            MATCH (d:Device)-[:HAS_INTERFACE]->(i:Interface)
+            WITH d, coalesce(i.name_canonical, i.name) AS key,
+                 collect({
+                     id: i.id,
+                     last_seen: coalesce(i.last_seen, 0),
+                     first_seen: coalesce(i.first_seen, 0)
+                 }) AS ifaces
+            WHERE key IS NOT NULL AND key <> '' AND size(ifaces) > 1
+            RETURN d.id AS device_id,
+                   toLower(coalesce(d.platform, '')) AS platform,
+                   key, ifaces
+            """
+        )
+        async for row in res:
+            groups_seen += 1
+            ifaces = row["ifaces"] or []
+            winner, losers = _pick_iface_winner(row["platform"], ifaces)
+            wid = winner.get("id")
+            if not wid:
+                continue
+            for loser in losers:
+                lid = loser.get("id")
+                if lid and lid != wid:
+                    pairs.append((wid, lid))
+
+        if not pairs:
+            if groups_seen:
+                log.debug("correlate.iface_dups.no_action",
+                          groups_seen=groups_seen)
+            return 0
+
+        # Step 2: copy missing properties from loser → winner. We use a
+        # local list of "always interesting" SNMP-only fields so the
+        # canonical (usually meraki-if) node gets all the counter /
+        # health data the snmp-if shadow was carrying.
+        # Notes:
+        #   * keys IN _IFACE_NON_MERGEABLE_KEYS are skipped (identity).
+        #   * w[k] IS NULL test is loose-typed on purpose: an empty string
+        #     or an explicit ``false`` shouldn't be clobbered, but a true
+        #     null should.
+        rows = [{"win_id": w, "lose_id": l} for (w, l) in pairs]
+        nonmerge = list(_IFACE_NON_MERGEABLE_KEYS)
+        await session.run(
+            """
+            UNWIND $rows AS row
+            MATCH (w:Interface {id: row.win_id}), (l:Interface {id: row.lose_id})
+            WHERE w <> l
+            WITH w, l,
+                 [k IN keys(l) WHERE NOT (k IN $nonmerge)
+                    AND l[k] IS NOT NULL AND w[k] IS NULL] AS copy_keys
+            FOREACH (k IN copy_keys | SET w[k] = l[k])
+            // Track which sources contributed to this canonical Interface,
+            // so the Explorer/debug UI can answer "where did this port
+            // actually come from?" even after the merge.
+            WITH w, l
+            SET w.merged_sources = [s IN coalesce(w.merged_sources, [])
+                                    WHERE s <> coalesce(l.source_adapter, '')]
+                                   + CASE WHEN l.source_adapter IS NOT NULL
+                                          THEN [l.source_adapter] ELSE [] END,
+                w.first_seen = CASE
+                    WHEN l.first_seen IS NULL THEN w.first_seen
+                    WHEN w.first_seen IS NULL THEN l.first_seen
+                    WHEN l.first_seen < w.first_seen THEN l.first_seen
+                    ELSE w.first_seen END,
+                w.last_seen = CASE
+                    WHEN l.last_seen IS NULL THEN w.last_seen
+                    WHEN w.last_seen IS NULL THEN l.last_seen
+                    WHEN l.last_seen > w.last_seen THEN l.last_seen
+                    ELSE w.last_seen END
+            """,
+            rows=rows, nonmerge=nonmerge,
+        )
+
+        # Step 3: re-point each known outbound relationship type from
+        # loser → winner. MERGE makes the copy idempotent — if the
+        # winner already has the same edge to the same target, we
+        # skip and just drop the loser's edge.  Each relationship
+        # type gets its own UNWIND pass so the query plan stays
+        # focused on one MATCH pattern (Cypher refuses to UNION
+        # variable-typed relationships in a single statement without
+        # APOC, which this database doesn't have).
+        rel_types_outbound = [
+            "LEARNED_MAC",
+            "HAS_ARP",
+            "ASSIGNED_IP",
+            "STP_LINK",
+            "LOGICAL_MEMBER",
+            "TAGGED",
+            "UNTAGGED",
+            "HAS_PREFIX",
+        ]
+        for rtype in rel_types_outbound:
+            await session.run(
+                f"""
+                UNWIND $rows AS row
+                MATCH (l:Interface {{id: row.lose_id}})-[r:{rtype}]->(other)
+                MATCH (w:Interface {{id: row.win_id}})
+                WHERE w <> l
+                MERGE (w)-[nr:{rtype}]->(other)
+                ON CREATE SET nr = properties(r)
+                DELETE r
+                """,
+                rows=rows,
+            )
+
+        # Step 4: finally, DETACH DELETE the loser nodes.  This drops the
+        # HAS_INTERFACE edge from the device (since the winner already has
+        # its own) plus any remaining edge type we didn't explicitly
+        # re-point above (we'd rather lose an unknown rel type than
+        # accidentally preserve a stale parallel pointer).
+        await session.run(
+            """
+            UNWIND $rows AS row
+            MATCH (l:Interface {id: row.lose_id})
+            WHERE l.id <> row.win_id
+            DETACH DELETE l
+            """,
+            rows=rows,
+        )
+        merged = len(pairs)
+
+    if merged:
+        log.info(
+            "correlate.iface_dups.merged",
+            count=merged,
+            groups=groups_seen,
+        )
+    return merged
+
+
+async def _purge_orphan_interfaces(
+    stale_after_seconds: float = 3600.0,
+) -> int:
+    """Delete Interface nodes that have no HAS_INTERFACE inbound edge.
+
+    These accumulate when an adapter cycle creates Interface nodes for a
+    Device that later gets renamed (so the HAS_INTERFACE edge points at
+    the old Device id, but ingest-purge removed it) or when the Device is
+    deleted but the Interface bag wasn't cleaned up. Either way the rows
+    are unreachable from the Device graph — they don't appear in the
+    Explorer and they confuse the cable / link decorators that JOIN by
+    name_canonical (they introduce ghost candidates whose device is
+    invisible).
+
+    We use a freshness floor (default 1 hour) before deleting so a brief
+    cross-cycle window where a new Interface exists before its
+    HAS_INTERFACE edge has been written doesn't lose data. Interfaces
+    with no ``last_seen`` at all are considered stale immediately —
+    those were created by very old adapter versions or by ingest paths
+    that don't stamp freshness.
+    """
+    import time as _t
+    cutoff = _t.time() - max(60.0, stale_after_seconds)
+    driver = get_driver()
+    async with driver.session() as session:
+        res = await session.run(
+            """
+            MATCH (i:Interface)
+            WHERE NOT (:Device)-[:HAS_INTERFACE]->(i)
+              AND coalesce(i.last_seen, 0) < $cutoff_ms
+            WITH i LIMIT 10000
+            DETACH DELETE i
+            RETURN count(i) AS n
+            """,
+            # `last_seen` is stamped by the ingest layer
+            # (``_touch_last_seen_nodes``) as ms-since-epoch via
+            # ``epoch_ms()``, matching Cypher's ``timestamp()`` builtin.
+            # So compare in the same unit and convert our floating
+            # seconds cutoff to integer ms.
+            cutoff_ms=int(cutoff * 1000.0),
+        )
+        rec = await res.single()
+        n = (rec["n"] if rec else 0) or 0
+
+    if n:
+        log.info("correlate.iface_orphans.purged", count=n,
+                 stale_after_seconds=stale_after_seconds)
+    return n
 
 
 async def _decorate_physical_links_l2() -> int:

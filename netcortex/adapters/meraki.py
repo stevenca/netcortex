@@ -627,6 +627,151 @@ class MerakiAdapter(PlatformAdapter):
                 for p in resp.json()
             ]
 
+    async def get_switch_port_configs(
+        self, serial: str,
+    ) -> dict[str, dict[str, Any]]:
+        """Return per-port admin configuration for one MS switch.
+
+        Calls ``/devices/{serial}/switch/ports`` (the **config** endpoint,
+        distinct from ``/statuses`` below). This is the only place to
+        pick up the admin-set port settings that the Dashboard exposes
+        and SNMP cannot reach:
+
+          * ``enabled``      — admin-up/down (vs ``oper_status`` from SNMP)
+          * ``type``         — ``access`` | ``trunk`` | ``stack``
+          * ``vlan``         — untagged / access VLAN id
+          * ``voiceVlan``    — voice VLAN id (or null)
+          * ``allowedVlans`` — trunk allow-list: literal ``"all"`` or a
+                               CSV range string like ``"1,3,5-10"``
+          * ``rstpEnabled``  — STP/RSTP toggle on the port
+          * ``stpGuard``     — one of ``"disabled"`` / ``"root guard"`` /
+                               ``"bpdu guard"`` / ``"loop guard"``
+
+        Returned shape per port (only set keys are emitted, so unset
+        fields don't clobber data the SNMP/LLDP path already wrote):
+        ``{port_id: {enabled, mode, vlans_access, vlans_allowed,
+                     voice_vlan, stp_portfast, stp_bpdu_guard,
+                     stp_bpdu_filter, stp_root_guard, stp_loop_guard,
+                     port_description}}``.
+
+        Notes:
+          * ``mode`` is mapped onto the same vocabulary the SNMP adapter
+            uses (``access`` / ``trunk``) so downstream NetBox writeback
+            and L2 decoration can treat both sources interchangeably.
+          * ``allowedVlans=="all"`` is rendered as the sentinel string
+            ``"all"`` so the NetBox writeback can pick the right NetBox
+            mode (``tagged-all`` vs ``tagged``). Numeric ranges are
+            parsed into a sorted list of ints, range-expanded.
+          * Meraki ports do not expose ``portfast`` separately — the
+            ``rstpEnabled`` flag is the closest equivalent. ``portfast``
+            stays None (i.e. unstamped) for Meraki ports; SNMP picks
+            it up for Cisco-style devices.
+
+        Empty dict on failure or non-switch hardware (404).
+        """
+        async with _client(self._api_key) as client:
+            try:
+                resp = await client.get(
+                    f"{self._base_url}/devices/{serial}/switch/ports",
+                )
+            except Exception as exc:
+                log.debug("meraki.port_configs.fetch_failed",
+                          serial=serial, error=str(exc))
+                return {}
+            if resp.status_code == 404:
+                return {}  # not a switch
+            if not resp.is_success:
+                log.debug("meraki.port_configs.http_error",
+                          serial=serial, status=resp.status_code)
+                return {}
+
+            out: dict[str, dict[str, Any]] = {}
+            for p in resp.json():
+                port_id = str(p.get("portId", ""))
+                if not port_id:
+                    continue
+
+                # Port mode normalization. Meraki's "trunk" maps directly;
+                # "access" maps directly; "stack" is the inter-switch
+                # stack port and we don't expose a mode for those (NetBox
+                # has no equivalent — they're not switchports).
+                ptype = (p.get("type") or "").lower().strip()
+                if ptype == "trunk":
+                    mode = "trunk"
+                elif ptype == "access":
+                    mode = "access"
+                else:
+                    mode = None  # stack / unknown — leave unset
+
+                # Allowed VLANs: "all" is a sentinel, anything else is
+                # a comma-separated mix of single VIDs and ranges.
+                allowed_str = (p.get("allowedVlans") or "").strip()
+                vlans_allowed: list[int] | str | None
+                if allowed_str.lower() == "all":
+                    vlans_allowed = "all"
+                elif allowed_str:
+                    vids: set[int] = set()
+                    for tok in allowed_str.split(","):
+                        tok = tok.strip()
+                        if not tok:
+                            continue
+                        if "-" in tok:
+                            lo_s, hi_s = tok.split("-", 1)
+                            try:
+                                lo, hi = int(lo_s), int(hi_s)
+                            except ValueError:
+                                continue
+                            for v in range(min(lo, hi), max(lo, hi) + 1):
+                                if 1 <= v <= 4094:
+                                    vids.add(v)
+                        else:
+                            try:
+                                v = int(tok)
+                            except ValueError:
+                                continue
+                            if 1 <= v <= 4094:
+                                vids.add(v)
+                    vlans_allowed = sorted(vids) if vids else None
+                else:
+                    vlans_allowed = None
+
+                # STP guard → one of three booleans. Meraki only exposes
+                # ONE active guard at a time (the dashboard radio is
+                # mutually exclusive), so the other two stay None.
+                guard = (p.get("stpGuard") or "").lower().strip()
+                stp_root_guard  = (guard == "root guard")
+                stp_bpdu_guard  = (guard == "bpdu guard")
+                stp_loop_guard  = (guard == "loop guard")
+
+                # Build the per-port property bag. ``None``-valued keys
+                # are filtered out at the caller via ``if v is None``,
+                # so don't materialize them when the source had no value.
+                row: dict[str, Any] = {}
+                if p.get("enabled") is not None:
+                    row["enabled"] = bool(p["enabled"])
+                if mode is not None:
+                    row["mode"] = mode
+                if p.get("vlan") is not None:
+                    row["vlans_access"] = int(p["vlan"])
+                if vlans_allowed is not None:
+                    row["vlans_allowed"] = vlans_allowed
+                if p.get("voiceVlan") is not None:
+                    row["voice_vlan"] = int(p["voiceVlan"])
+                # Always emit the guards (incl. False) when stpGuard was
+                # set at all, so the merger picks up "guard turned off"
+                # transitions instead of leaving stale True values.
+                if guard:
+                    row["stp_root_guard"] = stp_root_guard
+                    row["stp_bpdu_guard"] = stp_bpdu_guard
+                    row["stp_loop_guard"] = stp_loop_guard
+                # Don't write stp_portfast / stp_bpdu_filter — Meraki
+                # doesn't expose those concepts. SNMP fills them in
+                # for Cisco-style devices.
+                if p.get("name"):
+                    row["port_description"] = str(p["name"])[:200]
+                out[port_id] = row
+            return out
+
     async def get_switch_port_statuses(
         self, serial: str, timespan: int = 600,
     ) -> dict[str, dict[str, Any]]:
@@ -1684,10 +1829,32 @@ class MerakiAdapter(PlatformAdapter):
                 async with port_sem:
                     return s, await self.get_switch_port_statuses(s)
 
+            async def _fetch_port_configs(s: str) -> tuple[str, dict]:
+                # Same throttle as statuses — both hit the Dashboard
+                # API and we don't want a single org to burn through
+                # its 5 req/s budget twice over.
+                async with port_sem:
+                    return s, await self.get_switch_port_configs(s)
+
             port_results = await asyncio.gather(
                 *[_fetch_port_statuses(s) for s in switch_serials_for_ports],
                 return_exceptions=True,
             )
+            # Pull port configs (admin status, mode, VLANs, STP guard)
+            # in the same step so they're available when we build the
+            # per-port property bag below. Config and statuses are
+            # disjoint key-sets, so merging is a simple .update.
+            config_results = await asyncio.gather(
+                *[_fetch_port_configs(s) for s in switch_serials_for_ports],
+                return_exceptions=True,
+            )
+            port_configs_by_serial: dict[str, dict[str, dict[str, Any]]] = {}
+            for item in config_results:
+                if isinstance(item, Exception):
+                    continue
+                serial, cfg_map = item
+                if cfg_map:
+                    port_configs_by_serial[serial] = cfg_map
             # Build a quick set of existing interface IDs so we don't
             # double-emit nodes for ports that step 5 already created
             # from LLDP/CDP discovery.  We MERGE properties either way
@@ -1708,6 +1875,7 @@ class MerakiAdapter(PlatformAdapter):
                 dev_node = device_node_map.get(serial)
                 if not dev_node:
                     continue
+                cfg_for_serial = port_configs_by_serial.get(serial, {})
                 for port_id, stats in port_map.items():
                     iface_id = f"meraki-if:{serial}:{port_id}"
                     # Only emit non-None values so unset fields don't
@@ -1721,6 +1889,19 @@ class MerakiAdapter(PlatformAdapter):
                         if v is None:
                             continue
                         props[k] = v
+                    # Layer in admin-set port configuration (enabled,
+                    # mode, vlans_access, vlans_allowed, voice_vlan,
+                    # stp_*_guard). These are disjoint from the runtime
+                    # stats keyspace so .update is safe; if Meraki ever
+                    # adds a runtime key that collides we want config
+                    # to lose to runtime (statuses are fresher), so
+                    # config is applied first.
+                    for k, v in (cfg_for_serial.get(port_id) or {}).items():
+                        if v is None:
+                            continue
+                        # Don't overwrite a status-derived value with
+                        # an older config value of the same key.
+                        props.setdefault(k, v)
                     if iface_id not in existing_iface_ids:
                         existing_iface_ids.add(iface_id)
                         data.nodes.append(GraphNode(

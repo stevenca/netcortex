@@ -177,6 +177,27 @@ OID_VLAN_TRUNK_ENABLED2K = "1.3.6.1.4.1.9.9.46.1.6.1.1.17"
 OID_VLAN_TRUNK_ENABLED3K = "1.3.6.1.4.1.9.9.46.1.6.1.1.18"
 OID_VLAN_TRUNK_ENABLED4K = "1.3.6.1.4.1.9.9.46.1.6.1.1.19"
 
+# CISCO-STP-EXTENSIONS-MIB — per-port PortFast / BPDU guard / BPDU filter /
+# Root guard / Loop guard. Cisco-only OIDs (IOS, IOS-XE, NX-OS).
+#   stpxFastStartPortTable (.1.6.2) is INDEXED BY ifIndex.
+#     .1.2  stpxFastStartPortMode       INTEGER {enable(1), disable(2), trunk(3), default(4)}
+#     .1.3  stpxFastStartPortEnable     TruthValue {1=true, 2=false}   ← op portfast
+#     .1.4  stpxFastStartPortBpduGuardMode  INTEGER {enable(1), disable(2), default(3)}
+#     .1.5  stpxFastStartPortBpduFilterMode INTEGER {enable(1), disable(2), default(3)}
+#   stpxRootGuardConfigTable (.1.13.1) — indexed by dot1dBasePortNumber.
+#     .1.1  stpxRootGuardConfigEnabled  TruthValue
+#   stpxLoopGuardConfigTable (.1.16.1) — indexed by dot1dBasePortNumber.
+#     .1.1  stpxLoopGuardConfigEnabled  TruthValue
+# Devices that don't implement these MIBs (Arista, generic Linux switches)
+# just leave the rows empty and the merge below picks up the Meraki/SNMP
+# values it does have. All STP-extension polls fail soft.
+OID_STPX_FAST_PORT_MODE     = "1.3.6.1.4.1.9.9.82.1.6.2.1.2"
+OID_STPX_FAST_PORT_ENABLE   = "1.3.6.1.4.1.9.9.82.1.6.2.1.3"
+OID_STPX_FAST_BPDU_GUARD    = "1.3.6.1.4.1.9.9.82.1.6.2.1.4"
+OID_STPX_FAST_BPDU_FILTER   = "1.3.6.1.4.1.9.9.82.1.6.2.1.5"
+OID_STPX_ROOT_GUARD_ENABLED = "1.3.6.1.4.1.9.9.82.1.13.1.1.1"
+OID_STPX_LOOP_GUARD_ENABLED = "1.3.6.1.4.1.9.9.82.1.16.1.1.1"
+
 # IEEE Q-BRIDGE-MIB — vendor-neutral fallback for VLAN egress per port.
 # dot1qVlanCurrentEgressPorts gives a port bitmap per (TimeMark, VlanIndex).
 # We need to transpose (vlan → ports) into (port → vlans) at the device side.
@@ -1116,6 +1137,16 @@ def _build_interface_health_nodes(
         name = iface.get("name") or f"if-{ifindex}"
         iface_id = f"snmp-if:{dev_node_id}:{name}"
 
+        # Translate trunk_mode (the on-the-wire SNMP value) into the
+        # shared ``mode`` vocabulary used downstream (Meraki + NetBox
+        # writeback). "trunk"/"access" map 1:1; anything else becomes
+        # None so the merger doesn't clobber a richer value from a
+        # peer source. "tagged-all" lives only in NetBox land (when
+        # the allow-list is all 4094 VLANs); we keep "trunk" here and
+        # let the writeback decide based on vlans_allowed cardinality.
+        _tm = iface.get("trunk_mode")
+        mode_val = "access" if _tm == "access" else ("trunk" if _tm == "trunk" else None)
+
         props = {
             "name": name,
             "ifindex": int(ifindex) if ifindex.isdigit() else ifindex,
@@ -1123,14 +1154,28 @@ def _build_interface_health_nodes(
             "alias": iface.get("alias"),
             "mac": iface.get("mac"),
             "oper_status": iface.get("oper_status"),
+            # ifAdminStatus → enabled (dev62). Authoritative source for
+            # the NetBox ``enabled`` flag.
+            "enabled": iface.get("enabled"),
             "speed_mbps": iface.get("speed_mbps"),
             # L2 attributes (populated by _poll_port_vlans). Stored as
             # plain dict/list values so the UI can render them without
             # extra Cypher round-trips.
             "trunk_mode": iface.get("trunk_mode"),
+            "mode":         mode_val,
             "vlans_access": iface.get("vlans_access"),
             "vlans_allowed": iface.get("vlans_allowed"),
             "native_vlan": iface.get("native_vlan"),
+            # Per-port STP extensions (dev62, _poll_stp_extensions).
+            # Only set when the device actually responded to the
+            # CISCO-STP-EXTENSIONS-MIB walks; left unset on non-Cisco
+            # platforms so the merger can pick up Meraki's stp_*_guard
+            # without conflict.
+            "stp_portfast":    iface.get("stp_portfast"),
+            "stp_bpdu_guard":  iface.get("stp_bpdu_guard"),
+            "stp_bpdu_filter": iface.get("stp_bpdu_filter"),
+            "stp_root_guard":  iface.get("stp_root_guard"),
+            "stp_loop_guard":  iface.get("stp_loop_guard"),
             # Health metrics — surface as Cytoscape-friendly fields
             **health,
             "health_updated_at": _now_ts(),
@@ -1207,10 +1252,14 @@ async def _poll_interfaces(sess: _SnmpSession) -> dict[str, dict[str, Any]]:
         ifaces.setdefault(idx, {})["name"] = str(val)
 
     # Device responded — collect remaining interface properties concurrently.
-    alias_rows, phys_rows, status_rows, speed_rows = await asyncio.gather(
+    # ifAdminStatus is the admin-set state (1=up, 2=down, 3=testing) and is
+    # the only authoritative source for the NetBox ``enabled`` flag —
+    # ifOperStatus alone can't distinguish "shut" from "no cable".
+    alias_rows, phys_rows, status_rows, admin_rows, speed_rows = await asyncio.gather(
         sess.walk(OID_IF_ALIAS),
         sess.walk(OID_IF_PHYS_ADDR),
         sess.walk(OID_IF_OPER_STATUS),
+        sess.walk(OID_IF_ADMIN_STATUS),
         sess.walk(OID_IF_SPEED),
     )
 
@@ -1227,6 +1276,14 @@ async def _poll_interfaces(sess: _SnmpSession) -> dict[str, dict[str, Any]]:
             "up" if str(val) == "1" else "down"
         )
 
+    for oid, val in admin_rows:
+        # ifAdminStatus: 1=up (enabled), 2=down (shut/disabled), 3=testing.
+        # Anything other than "1" is considered disabled for the NetBox
+        # ``enabled`` flag — testing(3) shouldn't count as enabled either.
+        ifaces.setdefault(oid.rsplit(".", 1)[-1], {})["enabled"] = (
+            str(val) == "1"
+        )
+
     for oid, val in speed_rows:
         try:
             ifaces.setdefault(oid.rsplit(".", 1)[-1], {})["speed_mbps"] = int(val)
@@ -1234,6 +1291,95 @@ async def _poll_interfaces(sess: _SnmpSession) -> dict[str, dict[str, Any]]:
             pass
 
     return ifaces
+
+
+async def _poll_stp_extensions(
+    sess: _SnmpSession,
+    if_map: dict[str, dict[str, Any]],
+    dot1d_to_ifindex: dict[str, str] | None = None,
+) -> None:
+    """Augment ``if_map`` with per-port STP extension settings.
+
+    Reads CISCO-STP-EXTENSIONS-MIB to populate (when known):
+      * ``stp_portfast``     — bool (true when PortFast is active on the port)
+      * ``stp_bpdu_guard``   — bool
+      * ``stp_bpdu_filter``  — bool
+      * ``stp_root_guard``   — bool
+      * ``stp_loop_guard``   — bool
+
+    PortFast / BPDU guard / BPDU filter tables are indexed by ifIndex (so
+    we can write directly into ``if_map``). Root Guard / Loop Guard
+    tables are indexed by dot1dBasePortNumber, so the caller must pass
+    ``dot1d_to_ifindex`` (the result of walking
+    ``dot1dBasePortIfIndex``); when None or empty, those two settings
+    are skipped silently.
+
+    Every walk fails soft. A device that doesn't implement
+    CISCO-STP-EXTENSIONS-MIB (Arista, generic Linux switches) just leaves
+    the fields unset and downstream code treats that as "unknown".
+    """
+    try:
+        portfast_rows, bpdu_guard_rows, bpdu_filter_rows = await asyncio.gather(
+            sess.walk(OID_STPX_FAST_PORT_ENABLE),
+            sess.walk(OID_STPX_FAST_BPDU_GUARD),
+            sess.walk(OID_STPX_FAST_BPDU_FILTER),
+            return_exceptions=True,
+        )
+    except Exception as exc:
+        log.debug("snmp.stp_ext.fastport_failed", error=str(exc))
+        portfast_rows = bpdu_guard_rows = bpdu_filter_rows = []
+
+    # Helpers — these enums share a "1 = enabled, everything else off"
+    # pattern, so a single coercer keeps the parsing readable.
+    def _truthy(val: Any) -> bool:
+        # ``1`` means enable for both TruthValue and the mode enums in
+        # this MIB; ``2`` is disable; ``3``/``4`` are "default" (which
+        # on a normal port means PortFast off / guard off). Treat as
+        # bool to avoid leaking the platform-internal enum into the
+        # graph schema.
+        return str(val) == "1"
+
+    if not isinstance(portfast_rows, Exception):
+        for oid, val in portfast_rows or []:
+            idx = oid.rsplit(".", 1)[-1]
+            if idx in if_map:
+                if_map[idx]["stp_portfast"] = _truthy(val)
+    if not isinstance(bpdu_guard_rows, Exception):
+        for oid, val in bpdu_guard_rows or []:
+            idx = oid.rsplit(".", 1)[-1]
+            if idx in if_map:
+                if_map[idx]["stp_bpdu_guard"] = _truthy(val)
+    if not isinstance(bpdu_filter_rows, Exception):
+        for oid, val in bpdu_filter_rows or []:
+            idx = oid.rsplit(".", 1)[-1]
+            if idx in if_map:
+                if_map[idx]["stp_bpdu_filter"] = _truthy(val)
+
+    # Root Guard / Loop Guard live in tables indexed by dot1dBasePortNumber,
+    # not ifIndex. Translate via the caller-supplied lookup table; skip
+    # silently when unavailable.
+    if dot1d_to_ifindex:
+        try:
+            root_rows, loop_rows = await asyncio.gather(
+                sess.walk(OID_STPX_ROOT_GUARD_ENABLED),
+                sess.walk(OID_STPX_LOOP_GUARD_ENABLED),
+                return_exceptions=True,
+            )
+        except Exception as exc:
+            log.debug("snmp.stp_ext.guard_failed", error=str(exc))
+            root_rows = loop_rows = []
+        if not isinstance(root_rows, Exception):
+            for oid, val in root_rows or []:
+                port_num = oid.rsplit(".", 1)[-1]
+                ifindex = dot1d_to_ifindex.get(port_num)
+                if ifindex and ifindex in if_map:
+                    if_map[ifindex]["stp_root_guard"] = _truthy(val)
+        if not isinstance(loop_rows, Exception):
+            for oid, val in loop_rows or []:
+                port_num = oid.rsplit(".", 1)[-1]
+                ifindex = dot1d_to_ifindex.get(port_num)
+                if ifindex and ifindex in if_map:
+                    if_map[ifindex]["stp_loop_guard"] = _truthy(val)
 
 
 async def _poll_port_vlans(
@@ -3912,6 +4058,25 @@ class SnmpAdapter(PlatformAdapter):
                 v.get("trunk_mode") == "trunk" for v in if_map.values()
             ):
                 per_vlan_diag = await _poll_per_vlan_stp(sess, if_map)
+
+        # dev62: per-port STP extension settings (portfast, BPDU guard,
+        # BPDU filter, root guard, loop guard). Cisco-only MIB — devices
+        # that don't implement it just leave the fields unset.
+        # We need dot1dBasePortIfIndex for the root/loop guard tables
+        # (those are indexed by dot1dBasePortNumber, not ifIndex); fall
+        # back to a portfast-only poll if the bridge mapping isn't
+        # available.
+        if profile.includes("interface") and self._collect_stp and if_map:
+            try:
+                dot1d_rows = await sess.walk(OID_DOT1D_BASE_PORT_IF)
+                dot1d_to_ifindex = {
+                    oid.rsplit(".", 1)[-1]: str(val).strip()
+                    for oid, val in (dot1d_rows or [])
+                    if str(val).strip()
+                }
+            except Exception:
+                dot1d_to_ifindex = {}
+            await _poll_stp_extensions(sess, if_map, dot1d_to_ifindex)
 
         # ── Adaptive cadence: decide whether this cycle should run the
         #    expensive topology walks or only the cheap "interface refresh"

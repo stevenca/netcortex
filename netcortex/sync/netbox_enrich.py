@@ -91,15 +91,30 @@ def _compute_netbox_delta(
     """
     fields: dict[str, dict[str, str]] = {}
 
-    nb_name_norm   = _normalize_name(netbox_name)
-    cur_name_norm  = _normalize_name(current_name)
-    if netbox_name and current_name and nb_name_norm != cur_name_norm:
-        fields["name"] = {"intent": netbox_name, "current": current_name}
-
+    # Note: per operator policy, the platform-observed name and the NetBox
+    # name are allowed to differ.  NetBox is authoritative for display
+    # (see Device.display_name) but we do not flag a name divergence as a
+    # mismatch — that would generate constant noise for every Meraki AP
+    # named "AP71 (78:0f:81:73:2a:70)" mapped to a clean NetBox name like
+    # "ap71".  Only serial divergence is a true data-integrity issue.
     nb_serial_norm  = (netbox_serial or "").strip().upper()
     cur_serial_norm = (current_serial or "").strip().upper()
     if nb_serial_norm and cur_serial_norm and nb_serial_norm != cur_serial_norm:
         fields["serial"] = {"intent": nb_serial_norm, "current": cur_serial_norm}
+
+    # Track name divergence informationally (not as a mismatch) so callers
+    # can audit naming drift without it polluting the mismatch report.
+    nb_name_norm   = _normalize_name(netbox_name)
+    cur_name_norm  = _normalize_name(current_name)
+    if netbox_name and current_name and nb_name_norm != cur_name_norm:
+        # Stored as a separate top-level key so analyse_field_mismatches
+        # can ignore it while a future audit tool can surface it.
+        if not fields:
+            return {"type": "name_divergence_only",
+                    "name_intent": netbox_name, "name_current": current_name}
+        # If we also have a serial issue, include the name info but the
+        # primary classification stays as field_mismatch.
+        fields["_name_divergence"] = {"intent": netbox_name, "current": current_name}
 
     if not fields:
         return {}

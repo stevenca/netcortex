@@ -16,7 +16,10 @@ async def reconcile_netbox_inventory(dry_run: bool = True) -> dict:
                          between matched NetBox devices.
 
     Also returns a read-only analysis section:
-      - site_mismatches: devices whose observed state differs from NetBox intent.
+      - field_mismatches: devices where a real field (e.g., serial) disagrees
+                         with NetBox.  Name-only divergences are deliberately
+                         excluded (operator policy: platform name and NetBox
+                         name may differ).
       - absent_devices:  devices in the graph but not in NetBox (candidates for
                          manual creation or cleanup).
 
@@ -49,25 +52,29 @@ async def get_netbox_discrepancies() -> dict:
     Return a read-only analysis of discrepancies between NetCortex and NetBox.
 
     Reports:
-      - site_mismatches: devices where the observed site or field values differ
-        from what NetBox says (netbox_delta is populated on the Device node).
+      - field_mismatches: devices where a real field (e.g., serial) differs
+        between the platform-observed value and NetBox.  Name-only divergences
+        are deliberately excluded because operator policy allows the
+        platform-observed name and the NetBox name to differ; NetBox is
+        authoritative for display via ``Device.display_name``.
       - absent_devices: devices present in the graph but not in NetBox — these
-        may need to be added to NetBox manually or investigated as rogue devices.
+        may need to be added to NetBox via the reconciler's create pass or
+        investigated as rogue devices.
 
     No writes are made; safe to call any time.
     """
     from netcortex.sync.netbox_writeback import (
-        analyse_site_mismatches,
+        analyse_field_mismatches,
         analyse_absent_devices,
     )
-    site_mismatches = await analyse_site_mismatches()
-    absent_devices  = await analyse_absent_devices()
+    field_mismatches = await analyse_field_mismatches()
+    absent_devices   = await analyse_absent_devices()
     return {
-        "site_mismatches": site_mismatches,
-        "absent_devices":  absent_devices,
+        "field_mismatches": field_mismatches,
+        "absent_devices":   absent_devices,
         "counts": {
-            "site_mismatches": len(site_mismatches),
-            "absent_devices":  len(absent_devices),
+            "field_mismatches": len(field_mismatches),
+            "absent_devices":   len(absent_devices),
         },
     }
 
