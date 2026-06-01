@@ -3,7 +3,7 @@ name: netcortex
 description: The intelligence layer for your network — MCP server, sync engine, and platform adapters
 type: application
 version: 0.2.0
-appVersion: "0.8.0-dev1"
+appVersion: "0.8.0-dev4"
 keywords:
   - network
   - mcp
