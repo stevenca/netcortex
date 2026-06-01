@@ -24,6 +24,40 @@ and this file MUST be updated together whenever `__version__` changes.
 
 ---
 
+## [0.8.0-dev3.1] — Deployment-safety follow-up
+
+### Added
+- `Settings.netbox_writeback_dry_run` config knob, sourced from either:
+  - env var `NETBOX_WRITEBACK_DRY_RUN=1` (highest precedence, intended for
+    one-off rollouts via Helm `worker.extraEnv`), or
+  - core secret key `netbox_writeback_dry_run: true`.
+  When true, the worker's periodic NetBox writeback loop still computes the
+  full diff and emits a structured report, but every PATCH/POST/DELETE is
+  short-circuited and tagged `dry_run=True`. The plumbing inside
+  `reconcile_to_netbox` has supported this since 0.7.0; only the worker
+  toggle was missing.
+
+### Changed
+- `worker._netbox_writeback_loop` now reads `cfg.netbox_writeback_dry_run`
+  instead of hardcoding `dry_run=False`, and tags the
+  `worker.netbox_writeback_done` log line with the active mode.
+
+### Rationale
+First production deploy of the 0.7.0 NetBox-as-system-of-record release on
+`cpn-ful-netcortex1` (the cluster is jumping `0.6.0.dev66 → 0.8.0-dev3`
+in one upgrade window). A one-cycle observe-only baseline lets us verify
+the diff against the live NetBox before any writes happen.
+
+Operational pattern:
+1. Deploy with `--set worker.extraEnv[0].name=NETBOX_WRITEBACK_DRY_RUN
+   --set worker.extraEnv[0].value="true"`.
+2. After one writeback cycle (≤30 minutes), inspect the
+   `worker.netbox_writeback_done` log and the per-entity reports.
+3. Helm-upgrade again with the env var removed (or set to `"false"`) to
+   enable real writes.
+
+---
+
 ## [0.8.0-dev3] — 2026-06-01
 
 ### Added — Subject taxonomy + `DedupStore` + `ReflexContext` (foundation for multi-source sensing)
