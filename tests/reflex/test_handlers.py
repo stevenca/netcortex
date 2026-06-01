@@ -49,13 +49,18 @@ def _event(subject: str, payload: dict[str, object]) -> EventMessage:
         ("bgp_drop", "sensory.snmp.trap.bgp_backward_transition.>"),
     ],
 )
-def test_handler_registered_with_expected_pattern(
+async def test_handler_registered_with_expected_pattern(
     handler_id: str, expected_pattern: str
 ) -> None:
     """Handler ids and patterns are part of the operator-facing surface.
 
     A rename here is fine, but it MUST be intentional — production
     operators read these ids in alerts and on the reconciliation UI.
+
+    Declared ``async`` purely to match the module-level
+    ``pytestmark = pytest.mark.asyncio``; there is nothing to await
+    here. Splitting this into its own file just to avoid the marker
+    would be a worse trade-off.
     """
     h = get_handler(handler_id)
     assert isinstance(h, ReflexHandler)
