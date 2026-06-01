@@ -67,27 +67,44 @@ def _compute_netbox_delta(
 ) -> dict:
     """Diff an observed (canonical) Device against a NetBox device record.
 
-    Returns an empty dict when there is nothing to record, or a structured
-    delta dict when at least one field disagrees::
+    Three possible return shapes:
 
-        {
-            "type": "field_mismatch",
+    1. **Everything agrees** → ``{}``.
+
+    2. **Name divergence only** (serials match or one side is missing) →
+
+       ::
+
+           {"type": "name_divergence_only",
+            "name_intent": <netbox_verbatim>,
+            "name_current": <observed_verbatim>}
+
+       Name divergence is NOT treated as a mismatch because operator policy
+       allows naming-convention drift (Meraki ``"AP71 (78:0f:...)"`` vs
+       NetBox ``"ap71"`` is the canonical case). It is surfaced as a
+       separately-typed delta so a future audit tool can render naming
+       drift without it polluting the operator mismatch report.
+
+    3. **Field mismatch** (serial differs, with or without a name divergence) →
+
+       ::
+
+           {"type": "field_mismatch",
             "fields": {
-                "name":   {"intent": <netbox_verbatim>, "current": <observed_verbatim>},
-                "serial": {"intent": <UPPER_SERIAL>,    "current": <UPPER_SERIAL>},
-            }
-        }
+                "serial":           {"intent": <UPPER>, "current": <UPPER>},
+                "_name_divergence": {"intent": <verbatim>, "current": <verbatim>},
+            }}
 
-    ``name`` values are stored verbatim (pre-trim) so the UI can show both
-    forms without re-normalising.  ``serial`` values are stored uppercased
-    because case is not meaningful for Cisco serials and upstream sources
-    disagree on capitalisation.
+       ``serial`` values are uppercased because case is not meaningful for
+       Cisco serials. ``_name_divergence`` is underscore-prefixed so the
+       mismatch report (``analyse_field_mismatches``) can filter it out
+       while still keeping the data attached for the audit tool.
 
     Per the NetCortex design philosophy, NetCortex is authoritative for
-    current state; NetBox is intent.  We never mutate either side here —
-    we surface the gap so a future reconciliation UI can flag it to the
-    operator.  Inputs are pre-trimmed; the caller is responsible for
-    case/format normalisation where appropriate.
+    current state; NetBox is intent. We never mutate either side here — we
+    surface the gap so the reconciliation UI can flag it to the operator.
+    Inputs are pre-trimmed; the caller is responsible for case/format
+    normalisation where appropriate.
     """
     fields: dict[str, dict[str, str]] = {}
 

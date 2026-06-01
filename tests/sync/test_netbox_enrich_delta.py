@@ -45,6 +45,14 @@ def test_name_delta_recorded_when_observed_differs() -> None:
     """The motivating case: an Intersight FI named ``FI-A-FCH2903782Y`` whose
     NetBox device record is ``cpn-ful-aipod-fi-A``.  Both forms are kept
     verbatim so the UI can show "intent → current" without re-normalising.
+
+    Policy (see ``_compute_netbox_delta`` docstring): a name divergence with
+    NO serial mismatch is reported with the dedicated ``name_divergence_only``
+    type, so that ``analyse_field_mismatches`` does not pollute the operator
+    mismatch report with naming-convention drift (Meraki "AP71 (78:0f:...)"
+    vs NetBox "ap71" being the canonical example). The data is still surfaced
+    in the top-level ``name_intent`` / ``name_current`` fields so a future
+    audit tool can render it.
     """
     delta = _compute_netbox_delta(
         netbox_name="cpn-ful-aipod-fi-A",
@@ -53,13 +61,9 @@ def test_name_delta_recorded_when_observed_differs() -> None:
         current_serial="FCH2903782Y",
     )
     assert delta == {
-        "type": "field_mismatch",
-        "fields": {
-            "name": {
-                "intent": "cpn-ful-aipod-fi-A",
-                "current": "FI-A-FCH2903782Y",
-            },
-        },
+        "type": "name_divergence_only",
+        "name_intent": "cpn-ful-aipod-fi-A",
+        "name_current": "FI-A-FCH2903782Y",
     }
 
 
@@ -86,6 +90,12 @@ def test_serial_delta_when_match_was_by_name_only() -> None:
 
 
 def test_both_deltas_recorded_when_both_differ() -> None:
+    """When BOTH a serial mismatch AND a name divergence exist, the primary
+    classification stays ``field_mismatch`` (because serial is a real data
+    integrity issue) and the name divergence is folded into ``fields`` under
+    the ``_name_divergence`` key so the mismatch report can include it
+    without flagging it as a serial-grade issue.
+    """
     delta = _compute_netbox_delta(
         netbox_name="intended-name",
         netbox_serial="intended-serial",
@@ -93,7 +103,17 @@ def test_both_deltas_recorded_when_both_differ() -> None:
         current_serial="observed-serial",
     )
     assert delta["type"] == "field_mismatch"
-    assert set(delta["fields"].keys()) == {"name", "serial"}
+    # ``_name_divergence`` is the underscore-prefixed sub-field marking the
+    # name drift; ``serial`` is the real mismatch.
+    assert set(delta["fields"].keys()) == {"_name_divergence", "serial"}
+    assert delta["fields"]["serial"] == {
+        "intent": "INTENDED-SERIAL",
+        "current": "OBSERVED-SERIAL",
+    }
+    assert delta["fields"]["_name_divergence"] == {
+        "intent": "intended-name",
+        "current": "observed-name",
+    }
 
 
 @pytest.mark.parametrize("netbox_name,current_name", [

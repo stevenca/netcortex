@@ -4,11 +4,14 @@ import asyncio
 import time
 import os
 from contextlib import asynccontextmanager
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import structlog
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+
+if TYPE_CHECKING:
+    from starlette.responses import PlainTextResponse
 
 from netcortex import __version__
 from netcortex.config import init_settings, get_settings
@@ -478,7 +481,7 @@ async def _metrics(request, call_next):
 
 
 @app.get("/metrics", include_in_schema=False)
-async def metrics() -> "starlette.responses.PlainTextResponse":  # type: ignore[name-defined]
+async def metrics() -> "PlainTextResponse":
     """Prometheus exposition format.  No external library required."""
     from starlette.responses import PlainTextResponse
 
