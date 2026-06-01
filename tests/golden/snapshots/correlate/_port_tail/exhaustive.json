@@ -1,0 +1,19 @@
+{
+  "port_tail/empty": "",
+  "port_tail/eth_lowercase": "1/46",
+  "port_tail/ethernet_short": "1/46",
+  "port_tail/forty_gig": "1/0/49",
+  "port_tail/four_hundred_gig": "1/0/49",
+  "port_tail/gi_short": "0/1",
+  "port_tail/hundred_gig": "1/0/49",
+  "port_tail/loopback": "0",
+  "port_tail/management": "1",
+  "port_tail/no_digits": "",
+  "port_tail/none": "",
+  "port_tail/port_channel": "1",
+  "port_tail/port_channel_high": "256",
+  "port_tail/te_short": "1/1/5",
+  "port_tail/ten_gig_3_slot": "1/1/5",
+  "port_tail/twenty_five_gig": "1/1/5",
+  "port_tail/vlan_svi": "80"
+}

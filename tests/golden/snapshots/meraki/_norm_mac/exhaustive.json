@@ -1,0 +1,21 @@
+{
+  "norm_mac/all_zeros": "00:00:00:00:00:00",
+  "norm_mac/broadcast": "ff:ff:ff:ff:ff:ff",
+  "norm_mac/cisco_dotted": "aa:bb:cc:dd:ee:ff",
+  "norm_mac/cisco_dotted_upper": "aa:bb:cc:dd:ee:ff",
+  "norm_mac/colon_lower": "aa:bb:cc:dd:ee:ff",
+  "norm_mac/colon_mixed": "aa:bb:cc:dd:ee:ff",
+  "norm_mac/colon_upper": "aa:bb:cc:dd:ee:ff",
+  "norm_mac/dash_separated": "aa:bb:cc:dd:ee:ff",
+  "norm_mac/empty": null,
+  "norm_mac/garbage": null,
+  "norm_mac/leading_trailing_whitespace": "aa:bb:cc:dd:ee:ff",
+  "norm_mac/long_input": null,
+  "norm_mac/multicast_bit_set": "01:00:5e:00:00:fb",
+  "norm_mac/no_separators": "aa:bb:cc:dd:ee:ff",
+  "norm_mac/none": null,
+  "norm_mac/partial_garbage": null,
+  "norm_mac/short_input": null,
+  "norm_mac/with_spaces": "aa:bb:cc:dd:ee:ff",
+  "norm_mac/with_unicode": null
+}

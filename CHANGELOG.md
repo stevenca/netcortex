@@ -24,6 +24,59 @@ and this file MUST be updated together whenever `__version__` changes.
 
 ---
 
+## [0.7.1-dev2] — 2026-05-31
+
+### Added — first contracts and golden snapshots
+
+- `netcortex/contracts/` namespace with three Protocol stubs:
+  - `EventBus` + `EventMessage` + `EventBusValidationError` — the thalamus
+    contract. NATS-style wildcard subscription semantics, at-least-once
+    delivery, no replay for late subscribers. Defines what any future
+    `NatsEventBus` / `KafkaEventBus` / etc. must satisfy.
+  - `SensoryAdapter` + `SensoryEvent` — the contract every input modality
+    implements. Same shape for poll adapters, webhook receivers, SNMP trap
+    listeners, and Cisco streaming-telemetry consumers. Carries
+    `modality`, `received_at`, `occurred_at`, `target`, `payload`,
+    `confidence`, and an append-only `provenance` chain.
+  - `Policy` + `Decision` + `PolicyContext` — the contract every pluggable
+    decision point implements. Distinguishes deterministic policies from
+    LLM-consulting ones via metadata; deterministic policies must round-trip
+    identically.
+- Package is at the bottom of the import graph — no `netcortex.*` imports.
+  Verified by `lint_no_self_rewrite` + manual import test.
+- `tests/contracts/` harness with three reference implementations
+  (`InMemoryEventBus`, `StubSensoryAdapter`, `ConstantPolicy`) and three
+  contract test suites. Adding a new implementation of any Protocol is a
+  one-line registry change in `tests/contracts/conftest.py`.
+- `tests/golden/` harness:
+  - `conftest.py` with `assert_snapshot(name, value)` fixture, normalized
+    JSON serialization, unified-diff failure output, and a
+    `--update-snapshots` flag for intentional changes.
+  - Five golden tests covering five load-bearing pure helpers:
+    - `correlate._port_tail` — Cisco port-name tail extraction
+      (17 cases covering 3-slot 25/40/100/400G, short forms,
+      port-channel, SVI, loopback, mgmt).
+    - `correlate._l2_rank` — L2 authoritativeness scoring matrix
+      (12 cases covering trunk/access/unknown-mode permutations).
+    - `correlate._resolve_active_iface` — composite decision using the
+      two above (7 cases including the critical speed-variant sibling
+      tiebreak).
+    - `correlate._is_public_asn` — IANA boundaries (23 cases including
+      every documentation/private range fencepost).
+    - `meraki._norm_mac` — MAC canonicalization (19 cases including all
+      common formats and malformed input).
+  - 11 snapshot files seeded; CI will verify they still match the live
+    helpers on every push.
+
+### Why these particular helpers
+
+All five are pure, all five are uncovered by existing unit tests, and all
+five sit directly under the modules that move during the brain-architecture
+refactor — `correlate.py` → `netcortex/association/`, `adapters/meraki.py`
+→ `netcortex/sensory/poll/meraki.py`. If the move silently changes any
+decision, these goldens fail loudly and the PR description has to explain
+the diff.
+
 ## [0.7.1-dev1] — 2026-05-31
 
 ### Added (CI + documentation foundation for the brain-mapped refactor)

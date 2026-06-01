@@ -1,0 +1,8 @@
+{
+  "anchor": "gigabitethernet0/0/1",
+  "result": {
+    "name": "GigabitEthernet0/0/1",
+    "trunk_mode": "access",
+    "vlans_access": 100
+  }
+}

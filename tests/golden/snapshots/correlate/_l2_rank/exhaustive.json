@@ -1,0 +1,14 @@
+{
+  "l2_rank/access_no_vlan": 10,
+  "l2_rank/access_vlan_1": 20,
+  "l2_rank/access_vlan_10": 60,
+  "l2_rank/access_vlan_none": 10,
+  "l2_rank/empty_dict": -1,
+  "l2_rank/no_trunk_mode_with_other_fields": 0,
+  "l2_rank/none_input": -1,
+  "l2_rank/trunk_allowed_none": 80,
+  "l2_rank/trunk_no_allowed": 80,
+  "l2_rank/trunk_with_allowed": 100,
+  "l2_rank/trunk_with_empty_allowed": 80,
+  "l2_rank/unknown_mode": 10
+}

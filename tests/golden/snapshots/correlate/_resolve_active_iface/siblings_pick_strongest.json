@@ -1,0 +1,12 @@
+{
+  "anchor": "TenGigabitEthernet1/1/5",
+  "result": {
+    "name": "TwentyFiveGigE1/1/5",
+    "trunk_mode": "trunk",
+    "vlans_allowed": [
+      10,
+      20,
+      30
+    ]
+  }
+}
