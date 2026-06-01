@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from netcortex.contracts import EventBus, Policy, SensoryAdapter
+from netcortex.contracts import DedupStore, EventBus, Policy, SensoryAdapter
 
 # ---------------------------------------------------------------------------
 # EventBus registry.
@@ -120,10 +120,40 @@ def policy_factory(request: pytest.FixtureRequest) -> Callable[[], Policy]:
     raise RuntimeError(f"unknown policy impl: {name}")
 
 
+# ---------------------------------------------------------------------------
+# DedupStore registry.
+# ---------------------------------------------------------------------------
+
+
+def _make_in_memory_dedup_store() -> DedupStore:
+    from netcortex.working.dedup import InMemoryDedupStore
+
+    return InMemoryDedupStore()
+
+
+# Redis-backed store lands in 0.9.0; when it does, add a
+# _make_redis_dedup_store factory here that pytest.skips when REDIS_URL is
+# absent, exactly the same pattern as _make_nats_event_bus above.
+DEDUP_STORE_IMPLEMENTATIONS: list[tuple[str, Callable[[], DedupStore]]] = [
+    ("in_memory", _make_in_memory_dedup_store),
+]
+
+
+@pytest.fixture(params=[name for name, _ in DEDUP_STORE_IMPLEMENTATIONS], ids=lambda n: n)
+def dedup_store_factory(request: pytest.FixtureRequest) -> Callable[[], DedupStore]:
+    name: str = request.param
+    for n, factory in DEDUP_STORE_IMPLEMENTATIONS:
+        if n == name:
+            return factory
+    raise RuntimeError(f"unknown dedup store impl: {name}")
+
+
 __all__: Iterable[str] = (
+    "DEDUP_STORE_IMPLEMENTATIONS",
     "EVENT_BUS_IMPLEMENTATIONS",
     "SENSORY_ADAPTER_IMPLEMENTATIONS",
     "POLICY_IMPLEMENTATIONS",
+    "dedup_store_factory",
     "event_bus_factory",
     "sensory_adapter_factory",
     "policy_factory",

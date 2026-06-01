@@ -58,7 +58,16 @@ _LOG = logging.getLogger(__name__)
 # Subject syntax — kept in sync with InMemoryEventBus so both backends reject
 # the same set of malformed subjects (the contract tests publish these as
 # negative cases and expect rejection from any conforming implementation).
-_VALID_PUBLISH_SUBJECT = re.compile(r"^[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)*$")
+# NATS subject grammar: dot-separated tokens where each token is one or
+# more printable, non-whitespace characters EXCLUDING the three reserved
+# meta-characters: '.' (token separator), '*' (single-token wildcard),
+# and '>' (multi-token wildcard). This admits real-world identifier
+# characters like ':' (MAC addresses), '|' (compound NetCortex targets
+# like 'device|interface'), '/' (interface names like Gi0/1), and '+'.
+# Earlier revisions used [A-Za-z0-9_-] which silently rejected
+# realistic subjects; that mismatch is now fixed so the bus accepts
+# everything the taxonomy in docs/architecture/subjects.md emits.
+_VALID_PUBLISH_SUBJECT = re.compile(r"^[^.\s*>]+(?:\.[^.\s*>]+)*$")
 
 
 def _validate_pattern(pattern: str) -> None:

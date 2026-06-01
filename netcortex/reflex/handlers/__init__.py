@@ -23,4 +23,4 @@ from __future__ import annotations
 # Keep these imports alphabetical so a diff reviewer can spot additions.
 from netcortex.reflex.handlers import bgp_drop  # noqa: F401
 from netcortex.reflex.handlers import link_down  # noqa: F401
-from netcortex.reflex.handlers import security_webhook  # noqa: F401
+from netcortex.reflex.handlers import security_alert  # noqa: F401

@@ -33,12 +33,14 @@ is a bug.
 
 from __future__ import annotations
 
+from netcortex.contracts.dedup_store import DedupStore
 from netcortex.contracts.event_bus import EventBus, EventBusValidationError, EventMessage
 from netcortex.contracts.policy import Decision, Policy, PolicyContext
 from netcortex.contracts.sensory_adapter import SensoryAdapter, SensoryEvent
 
 __all__ = [
     "Decision",
+    "DedupStore",
     "EventBus",
     "EventBusValidationError",
     "EventMessage",

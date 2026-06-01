@@ -24,6 +24,139 @@ and this file MUST be updated together whenever `__version__` changes.
 
 ---
 
+## [0.8.0-dev3] — 2026-06-01
+
+### Added — Subject taxonomy + `DedupStore` + `ReflexContext` (foundation for multi-source sensing)
+
+Third sub-step of the brain refactor. Locks in two things that every
+subsequent sub-step depends on: the **NATS subject taxonomy** and the
+**dedup contract**. No new publishers and no behavior change in
+production yet — that lands in `0.8.0-dev4`. This PR is intentionally a
+pure refactor so the foundations can be reviewed in isolation.
+
+#### Subject taxonomy
+
+`docs/architecture/subjects.md` is the new authoritative spec.
+Companion machine-readable constants in
+`netcortex/contracts/subjects.py`:
+
+* `SENSORY_EVENT_CLASSES` — closed vocabulary (`link_down`, `link_up`,
+  `bgp_drop`, `bgp_up`, `device_reboot`, `device_unreachable`,
+  `device_reachable`, `security_alert`, `config_change`,
+  `topology_change`, `route_advertisement_change`). Adding a class
+  requires a doc + constant change in the same PR.
+* `SENSORY_SOURCES` — `<modality>_<provenance>` tokens
+  (`snmp_trap`, `snmp_poll`, `meraki_webhook`, `gnmi_dialout`, …).
+* `sensory_subject(event_class, source, *target_parts)` — validated
+  builder. Refuses unknown classes/sources, empty parts, embedded
+  dots, whitespace.
+* `parse_sensory_subject(subject)` — inverse extractor; handlers use
+  it to derive the `fact_key` from the incoming subject.
+
+**Why event-class-first**: `sensory.<event_class>.<source>.<target>`
+lets a single handler subscribe to `sensory.link_down.>` and catch
+every source of link-down. The earlier `sensory.<modality>.<source>.<event>.<target>`
+ordering forced per-source subscriptions and made the
+"same-event-multiple-sources" dedup story awkward.
+
+#### `DedupStore` Protocol + `InMemoryDedupStore`
+
+`netcortex/contracts/dedup_store.py` defines the atomic check-and-record
+contract. `netcortex/working/dedup/in_memory.py` ships the only 0.8.0
+implementation:
+
+* Asyncio-safe (lock-protected mutations).
+* TTL-bounded with lazy expired-entry sweep (bounded budget per call
+  so tail latency is predictable).
+* Size-bounded with LRU eviction so a misbehaving publisher cannot OOM.
+* Accepts an injectable clock for fast deterministic unit tests.
+* Cap warnings and long-TTL warnings on long-lived state that would
+  mask flap behavior.
+
+Redis-backed implementation lands in 0.9.0 alongside working memory.
+Contract tests (9 cases) parametrize over every registered
+implementation — Redis only needs a factory function and a registry
+row to gain full coverage when it arrives.
+
+#### `ReflexContext` (handler dependency injection)
+
+`netcortex.reflex.protocol.ReflexContext` is the runtime dependency
+bag every handler receives on `handle(event, ctx)`. Frozen dataclass,
+all fields optional, new resources added by appending fields so old
+handlers are unaffected.
+
+* `ctx.dedup_store: DedupStore | None` — 0.8.0
+* `ctx.semantic_memory`, `ctx.working_memory`, `ctx.policy_engine`,
+  … — appended in later releases
+
+The `ReflexRunner` owns one `ReflexContext` (default-constructed if
+not supplied) and threads it through every dispatch. Existing failure-
+isolation and lifecycle behavior unchanged.
+
+#### Handler refactor — new patterns + dedup logic
+
+| Handler | Old pattern (dev2) | New pattern (dev3) | Dedup window |
+|---|---|---|---|
+| `link_down` | `sensory.snmp.trap.link_down.>` | `sensory.link_down.>` | 60 s |
+| `bgp_drop` | `sensory.snmp.trap.bgp_backward_transition.>` | `sensory.bgp_drop.>` | 60 s |
+| `security_alert` (renamed from `security_webhook`) | `sensory.meraki.webhook.security.>` | `sensory.security_alert.>` | 300 s |
+
+Renaming `security_webhook` → `security_alert` because the new handler
+is source-agnostic (Meraki today, Cisco AMP / future SIEM tomorrow);
+the file moved from `security_webhook.py` → `security_alert.py`. The
+operator-facing handler id is renamed accordingly.
+
+Each handler now constructs a `fact_key = "<event_class>|<target>"`
+(plus `event_type` for `security_alert`) and consults `ctx.dedup_store`
+when present. Duplicates return `outcome="skipped"` with the dedup
+rationale; first arrivals return `outcome="logged"` as before. Severity
+is intentionally demoted to `info` on skipped outcomes — they are
+corroboration telemetry, not a second incident.
+
+**Known limitation in 0.8.0**: a real flap (down/up/down within one
+window) collapses to a single fact. Tracked: the fusion stage in
+0.9.0 handles state transitions explicitly. See subjects.md "Dedup
+model" section.
+
+#### Tests
+
+* `tests/contracts/dedup_store/test_dedup_store_contract.py` — 9 cases
+  parametrized over every registered store implementation
+  (atomicity-under-concurrency, TTL expiry, empty-key rejection,
+  non-positive-TTL rejection, close idempotency, use-after-close raises).
+* `tests/contracts/test_subjects.py` — 13 cases for the taxonomy
+  builders, parser, vocabulary integrity checks.
+* `tests/working/dedup/test_in_memory.py` — 6 cases for the in-memory
+  store specifics (LRU eviction, lazy sweep, fake clock, ctor
+  validation, close clears state).
+* `tests/reflex/test_handlers.py` — updated for new patterns + 5 new
+  dedup cases (cross-source dedup for `link_down`, different-target
+  independence, missing-target skip-dedup, Meraki retry dedup for
+  `security_alert`, distinct-event-type-no-dedup, trap+gnmi dedup for
+  `bgp_drop`).
+* `tests/reflex/test_runner.py` — updated for new signature + 2 new
+  cases (default-context wiring, explicit-context threading).
+* `tests/reflex/test_registry.py` — updated for new handler signature
+  on the stub.
+
+### Breaking — pre-release only
+
+* `ReflexHandler.handle(event)` → `ReflexHandler.handle(event, ctx)` —
+  every handler implementation must take the context. The three
+  first-party handlers were updated in this PR; no external consumers
+  exist yet.
+* Handler ids: `security_webhook` → `security_alert`. The dev2 release
+  never persisted these to anywhere stable, so this rename is
+  cost-free; future renames after publishers exist will require the
+  dual-publish dance described in subjects.md.
+
+### Not yet wired
+
+* Still no publishers. Pollers continue to call correlator + writeback
+  directly. The first dual-write publisher lands in `0.8.0-dev4`.
+* Outcomes are logged only — Neo4j `:ReflexEvent` persistence + NetBox
+  journal mirror also land in `0.8.0-dev4`.
+
 ## [0.8.0-dev2] — 2026-06-01
 
 ### Added — Reflex skeleton: registry + runner + 3 first-party handlers

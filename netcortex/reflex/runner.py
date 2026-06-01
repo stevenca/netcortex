@@ -40,7 +40,7 @@ import traceback
 from datetime import datetime, timezone
 
 from netcortex.contracts.event_bus import EventBus, EventMessage
-from netcortex.reflex.protocol import ReflexHandler, ReflexOutcome
+from netcortex.reflex.protocol import ReflexContext, ReflexHandler, ReflexOutcome
 from netcortex.reflex.registry import all_handlers
 
 _LOG = logging.getLogger(__name__)
@@ -67,11 +67,17 @@ class ReflexRunner:
         bus: EventBus,
         *,
         handlers: list[ReflexHandler] | None = None,
+        context: ReflexContext | None = None,
     ) -> None:
         self._bus = bus
         self._handlers: list[ReflexHandler] = (
             list(handlers) if handlers is not None else list(all_handlers())
         )
+        # Default context has every shared resource set to None — the
+        # opt-out path for handlers that don't need any of them. The
+        # production wiring (web pod / worker pod) replaces this with a
+        # context that has dedup_store + future memory layers attached.
+        self._context: ReflexContext = context or ReflexContext()
         self._tasks: list[asyncio.Task[None]] = []
         self._started = False
         self._stopping = False
@@ -88,6 +94,11 @@ class ReflexRunner:
     def handlers(self) -> list[ReflexHandler]:
         """Snapshot of handlers this runner is driving (read-only)."""
         return list(self._handlers)
+
+    @property
+    def context(self) -> ReflexContext:
+        """The :class:`ReflexContext` every handler will receive on dispatch."""
+        return self._context
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -172,7 +183,7 @@ class ReflexRunner:
     ) -> None:
         """Invoke one handler safely and persist its outcome."""
         try:
-            outcome = await handler.handle(event)
+            outcome = await handler.handle(event, self._context)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

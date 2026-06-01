@@ -18,7 +18,7 @@ See ``docs/architecture/brain.md`` for the role of reflex in the
 brain-mapped architecture.
 """
 
-from netcortex.reflex.protocol import ReflexHandler, ReflexOutcome
+from netcortex.reflex.protocol import ReflexContext, ReflexHandler, ReflexOutcome
 from netcortex.reflex.registry import (
     DuplicateHandlerError,
     all_handlers,
@@ -29,6 +29,7 @@ from netcortex.reflex.runner import ReflexRunner
 
 __all__ = [
     "DuplicateHandlerError",
+    "ReflexContext",
     "ReflexHandler",
     "ReflexOutcome",
     "ReflexRunner",

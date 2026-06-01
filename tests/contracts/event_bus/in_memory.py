@@ -32,7 +32,19 @@ from netcortex.contracts.event_bus import (
 )
 
 _LOG = logging.getLogger(__name__)
-_VALID_PUBLISH_SUBJECT = re.compile(r"^[A-Za-z0-9_\-]+(?:\.[A-Za-z0-9_\-]+)*$")
+# NATS subject grammar: dot-separated tokens where each token is one or
+# more printable, non-whitespace characters EXCLUDING the three reserved
+# meta-characters: '.' (token separator), '*' (single-token wildcard),
+# and '>' (multi-token wildcard). This admits real-world identifier
+# characters like ':' (MACs), '|' (compound NetCortex targets), '/'
+# (interface names like Gi0/1), and '+' (URL-encoded payloads).
+#
+# Earlier revisions of this validator only allowed [A-Za-z0-9_-] which
+# silently rejected publishes like
+# 'sensory.link_down.snmp_trap.r1|Gi0/1', leading to subjects-look-
+# correct-but-publish-throws bugs. Match the canonical taxonomy in
+# docs/architecture/subjects.md.
+_VALID_PUBLISH_SUBJECT = re.compile(r"^[^.\s*>]+(?:\.[^.\s*>]+)*$")
 
 
 def _compile_pattern(pattern: str) -> re.Pattern[str]:
