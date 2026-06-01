@@ -146,6 +146,36 @@ neo4j:
       storageClass: ""
 
 # -----------------------------------------------------------------------------
+# NATS — the thalamus (event bus) introduced in 0.8.0.
+#
+# Single-node JetStream-enabled deployment. Adapters publish SensoryEvents
+# here; reflex handlers, the correlator, and (later) the stream bridge for
+# external agents all subscribe. See docs/architecture/brain.md.
+#
+# HA clustering (3 raft-replicated nodes) lands in a later 0.8.x patch when
+# event volume justifies the operational complexity.
+# -----------------------------------------------------------------------------
+nats:
+  enabled: true
+  image:
+    repository: nats
+    tag: "2.11-alpine"
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+  persistence:
+    size: 2Gi
+    storageClass: ""   # "" = cluster default
+  jetstream:
+    # File-backed JetStream store cap. Keep aligned with persistence.size
+    # (leave 20-30% headroom for indices and overhead).
+    maxFileStore: "1GB"
+
+# -----------------------------------------------------------------------------
 # NetCortex app data volume (/app/data)
 # -----------------------------------------------------------------------------
 persistence:

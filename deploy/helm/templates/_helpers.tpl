@@ -102,3 +102,12 @@ Neo4j bolt URI for peer containers.
 {{- define "netcortex.neo4jUri" -}}
 bolt://{{ include "netcortex.fullname" . }}-neo4j:7687
 {{- end }}
+
+{{/*
+NATS URL for peer containers — the thalamus (event bus) the brain refactor
+introduces in 0.8.0. Headless Service + StatefulSet means the pod is
+reachable as <fullname>-nats:4222 from within the cluster.
+*/}}
+{{- define "netcortex.natsUrl" -}}
+nats://{{ include "netcortex.fullname" . }}-nats:4222
+{{- end }}

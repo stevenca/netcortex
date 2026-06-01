@@ -1,0 +1,32 @@
+{{- if .Values.nats.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "netcortex.fullname" . }}-nats
+  labels:
+    {{- include "netcortex.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nats
+spec:
+  type: ClusterIP
+  clusterIP: None   # headless — StatefulSet pods get stable DNS via serviceName
+  selector:
+    {{- include "netcortex.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: nats
+  ports:
+    - name: client
+      port: 4222
+      targetPort: 4222
+      protocol: TCP
+    - name: monitor
+      # Used by the readiness/liveness probes against /healthz and by ops
+      # for /varz, /connz, /streamsz inspection. NOT exposed via Ingress.
+      port: 8222
+      targetPort: 8222
+      protocol: TCP
+    - name: cluster
+      # Reserved for future HA clustering (raft replication between NATS
+      # nodes). Inactive while replicas: 1.
+      port: 6222
+      targetPort: 6222
+      protocol: TCP
+{{- end }}

@@ -24,6 +24,94 @@ and this file MUST be updated together whenever `__version__` changes.
 
 ---
 
+## [0.8.0-dev1] — 2026-06-01
+
+### Added — Thalamus: NATS-backed event bus lands
+
+First sub-step of the brain-architecture refactor. Stands up the message
+bus that the rest of `0.8.0` will route every signal through. Nothing
+**uses** the bus yet — that's `0.8.0-dev3` — but the substrate is in
+place, the Protocol has a real production implementation, and CI verifies
+it against the same contract suite that covered the in-memory reference.
+
+See `docs/architecture/brain.md` for the role of the thalamus in the
+brain-mapped architecture and the rationale for NATS specifically.
+
+#### Code
+
+- `netcortex/thalamus/` — new package.
+  - `nats_bus.py` — `NatsEventBus` implementing the
+    `EventBus` Protocol against a real NATS server. NATS core pub/sub
+    (no JetStream) because the Protocol promises at-least-once delivery
+    within a session, no replay — which is exactly NATS core's semantics.
+    JetStream is enabled at the *server* level so future durable
+    consumers (episodic memory in 0.9.0; stream bridge for external
+    agents) can opt in via extension methods without redeploy.
+  - `__init__.py` — re-exports `NatsEventBus`. Package is intentionally
+    small; additional bus implementations (Redis, Kafka) would land as
+    siblings here.
+- Lifecycle: sync constructor (matches the `Callable[[], EventBus]` shape
+  the contract tests use as a factory); lazy connect on first
+  publish/subscribe; idempotent `close()` that drains pending publishes
+  and cleanly unsubscribes everyone before closing the socket.
+- Wire format: JSON-encoded UTF-8 payloads, NATS headers (server 2.2+)
+  for framing metadata. Malformed payloads surfaced as `{"_raw": ...}`
+  with a warning rather than crashing the consumer loop.
+
+#### Tests
+
+- `tests/contracts/conftest.py` — `NatsEventBus` registered as a second
+  `EventBus` implementation. The full contract suite (publish/subscribe
+  roundtrip, wildcard filtering, no-replay, independent subscribers,
+  invalid-subject rejection, invalid-payload rejection, idempotent close)
+  now runs against the real NATS backend in addition to `InMemoryEventBus`.
+- `NATS_URL` env-gated: when unset the parametrized cases skip (so devs
+  without a local broker can still run the suite); when set the same
+  cases exercise the production code path. CI always sets it.
+
+#### Infrastructure
+
+- `deploy/helm/templates/{statefulset,service,configmap}-nats.yaml` —
+  single-node JetStream-enabled NATS StatefulSet matching the existing
+  Redis/Neo4j pattern. Headless ClusterIP service for stable DNS;
+  ConfigMap-driven `nats.conf`; PVC-backed `/data/jetstream`. Liveness
+  probes the bare listener; readiness asserts JetStream subsystem is up.
+- `deploy/helm/values.yaml` — `nats:` block (enabled by default, 2.11-alpine,
+  2Gi PVC, resource caps that match Redis-class). HA clustering
+  (3-node raft) explicitly deferred to a later 0.8.x patch.
+- `deploy/helm/templates/_helpers.tpl` — `netcortex.natsUrl` template
+  consistent with `netcortex.redisUrl` and `netcortex.neo4jUri`.
+- `deployment-{web,worker}.yaml` — `NATS_URL` env var threaded into both
+  pods, gated on `nats.enabled` so operators that bring their own NATS
+  can disable the bundled chart.
+- `deploy/helm/Chart.yaml` — chart `version` 0.1.0 → 0.2.0, `appVersion`
+  0.6.0 → 0.8.0-dev1.
+
+#### Local dev
+
+- `docker-compose.yml` — NATS service added with JetStream enabled,
+  monitoring port exposed, healthcheck against `/healthz`. `NATS_URL`
+  wired into the netcortex app and worker containers.
+
+#### CI
+
+- `.github/workflows/ci.yaml` — `contracts` job gains a NATS service
+  container (`nats:2.11-alpine` core pub/sub, JetStream not needed for
+  Protocol-surface tests). `NATS_URL=nats://localhost:4222` exported so
+  the gated NATS contract cases actually execute.
+
+#### Dependencies
+
+- `nats-py>=2.6` added to runtime deps. Light dependency (async-only
+  client, no native code).
+
+### Not yet wired
+
+- No production code path uses the bus yet. Pollers still call the
+  correlator and writeback directly. The cutover lands in `0.8.0-dev3`
+  (first dual-write) and `0.8.0-dev5` (full cutover).
+- No `reflex/` handlers yet — those land in `0.8.0-dev2`.
+
 ## [0.7.1-dev3] — 2026-06-01
 
 ### Fixed — first green CI run

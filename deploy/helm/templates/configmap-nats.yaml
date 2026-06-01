@@ -1,0 +1,46 @@
+{{- if .Values.nats.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "netcortex.fullname" . }}-nats
+  labels:
+    {{- include "netcortex.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nats
+data:
+  # NATS server configuration.
+  #
+  # Single-node JetStream-enabled deployment. HA clustering (3+ nodes with
+  # raft-replicated streams) lands in a later 0.8.x patch once the reflex
+  # layer has driven enough message volume to justify the operational
+  # complexity. Until then a single replica with a PVC is enough — JetStream
+  # persists to disk and survives pod restart.
+  #
+  # The 0.8.0-dev1 NatsEventBus implementation uses NATS core pub/sub for
+  # at-least-once delivery within a subscription session (matching the
+  # EventBus Protocol). JetStream is enabled at the SERVER level so future
+  # durable consumers (episodic memory in 0.9.0, stream bridge for external
+  # agents) can opt in without redeploying NATS.
+  nats.conf: |
+    # Client connections
+    port: 4222
+    http_port: 8222   # monitoring endpoint (/healthz, /varz, etc.)
+
+    # Server identity
+    server_name: {{ include "netcortex.fullname" . }}-nats-0
+
+    # Logging
+    debug: false
+    trace: false
+    logtime: true
+
+    # Connection limits — generous defaults for in-cluster traffic.
+    max_connections: 1000
+    max_payload: 1MB
+
+    # JetStream — server-side persistence for future durable consumers.
+    jetstream {
+      store_dir: "/data/jetstream"
+      max_memory_store: 256MB
+      max_file_store: {{ .Values.nats.jetstream.maxFileStore | default "1GB" }}
+    }
+{{- end }}
