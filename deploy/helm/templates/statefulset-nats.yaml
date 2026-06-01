@@ -1,0 +1,96 @@
+{{- if .Values.nats.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "netcortex.fullname" . }}-nats
+  labels:
+    {{- include "netcortex.labels" . | nindent 4 }}
+    app.kubernetes.io/component: nats
+spec:
+  serviceName: {{ include "netcortex.fullname" . }}-nats
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "netcortex.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: nats
+  template:
+    metadata:
+      labels:
+        {{- include "netcortex.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: nats
+      annotations:
+        # Forces a rolling restart when nats.conf changes — otherwise the
+        # ConfigMap update would not be picked up by an already-running pod.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap-nats.yaml") . | sha256sum }}
+    spec:
+      # The official nats:alpine images run as UID 1000 by default. Same
+      # caveat as Redis/Neo4j on OpenShift restricted SCC — set runAsUser
+      # to null in a values override when targeting OCP, or grant anyuid.
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: nats
+          image: "{{ .Values.nats.image.repository }}:{{ .Values.nats.image.tag }}"
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--config"
+            - "/etc/nats/nats.conf"
+          ports:
+            - name: client
+              containerPort: 4222
+            - name: monitor
+              containerPort: 8222
+            - name: cluster
+              containerPort: 6222
+          resources:
+            {{- toYaml .Values.nats.resources | nindent 12 }}
+          volumeMounts:
+            - name: nats-config
+              mountPath: /etc/nats
+              readOnly: true
+            - name: nats-data
+              mountPath: /data
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: monitor
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              # ?js-enabled-only=true asserts JetStream subsystem is up,
+              # not just the listener — matters because reflex handlers
+              # and future durable consumers depend on it.
+              path: /healthz?js-enabled-only=true
+              port: monitor
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: nats-config
+          configMap:
+            name: {{ include "netcortex.fullname" . }}-nats
+            items:
+              - key: nats.conf
+                path: nats.conf
+  volumeClaimTemplates:
+    - metadata:
+        name: nats-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        {{- with .Values.nats.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.nats.persistence.size }}
+{{- end }}

@@ -107,6 +107,29 @@ jobs:
   contracts:
     name: Contract tests (Protocol conformance)
     runs-on: ubuntu-latest
+    services:
+      # Real NATS server so the NatsEventBus contract suite runs against the
+      # actual production backend, not just InMemoryEventBus. Core pub/sub
+      # only (no JetStream) — the EventBus Protocol is at-least-once-within-
+      # session, which is exactly NATS core. When 0.9.0 adds durable
+      # consumers for episodic memory we will run a separate job against a
+      # JetStream-enabled image. Monitoring port (8222) used by the GH
+      # service health check; client port (4222) is what NATS_URL points at.
+      nats:
+        image: nats:2.11-alpine
+        ports:
+          - 4222:4222
+          - 8222:8222
+        options: >-
+          --health-cmd "wget -qO- http://localhost:8222/healthz || exit 1"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      # tests/contracts/conftest.py keys off this — when set, the NATS
+      # implementation is included in the parametrize; when unset, it is
+      # skipped (so devs without a broker can still run the suite).
+      NATS_URL: nats://localhost:4222
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

@@ -38,6 +38,10 @@ spec:
               value: {{ include "netcortex.redisUrl" . | quote }}
             - name: NEO4J_URI
               value: {{ include "netcortex.neo4jUri" . | quote }}
+            {{- if .Values.nats.enabled }}
+            - name: NATS_URL
+              value: {{ include "netcortex.natsUrl" . | quote }}
+            {{- end }}
             {{- with .Values.web.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

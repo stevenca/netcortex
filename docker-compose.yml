@@ -15,10 +15,13 @@ services:
       # Peer containers — override URLs here
       REDIS_URL: redis://redis:6379/0
       NEO4J_URI: bolt://neo4j:7687
+      NATS_URL: nats://nats:4222
     depends_on:
       redis:
         condition: service_healthy
       neo4j:
+        condition: service_healthy
+      nats:
         condition: service_healthy
     healthcheck:
       test:
@@ -50,12 +53,15 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       NEO4J_URI: bolt://neo4j:7687
+      NATS_URL: nats://nats:4222
       SYNC_BACKEND: celery
       # INGEST_MODE: "stream"  # uncomment + enable ingest profile below
     depends_on:
       redis:
         condition: service_healthy
       neo4j:
+        condition: service_healthy
+      nats:
         condition: service_healthy
       netcortex:
         condition: service_healthy
@@ -169,10 +175,36 @@ services:
       start_period: 30s
     restart: unless-stopped
 
+  # NATS — thalamus / typed event bus (0.8.0+). Sensory adapters publish
+  # SensoryEvents here; reflex handlers, the correlator, and (later) the
+  # stream bridge for external agents all subscribe. See
+  # docs/architecture/brain.md for the brain-mapped architecture.
+  #
+  # JetStream enabled with file-backed store so durable consumers (episodic
+  # memory in 0.9.0) survive container restart. Monitoring on 8222 for the
+  # healthcheck; client traffic on 4222.
+  nats:
+    image: nats:2.11-alpine
+    container_name: netcortex-nats
+    command: ["-js", "-sd", "/data/jetstream", "-m", "8222"]
+    ports:
+      - "4222:4222"   # client
+      - "8222:8222"   # monitoring (/healthz, /varz, /connz)
+    volumes:
+      - nats_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
 volumes:
   netcortex_data:
   redis_data:
   neo4j_data:
+  nats_data:
 
 # ------------------------------------------------------------
 # Example: override for local dev (docker-compose.override.yml)
