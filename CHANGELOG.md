@@ -24,6 +24,72 @@ and this file MUST be updated together whenever `__version__` changes.
 
 ---
 
+## [0.8.0-dev2] — 2026-06-01
+
+### Added — Reflex skeleton: registry + runner + 3 first-party handlers
+
+Second sub-step of the brain refactor. Stands up the **reflex layer** —
+fast deterministic responders that subscribe to the thalamus and produce
+:class:`ReflexOutcome` records. Nothing publishes to the bus yet (that
+lands in `0.8.0-dev3`), so the handlers idle. The plumbing they idle on
+is fully tested against `InMemoryEventBus`, which (per `0.8.0-dev1`'s
+contract suite) behaves identically to the production `NatsEventBus` —
+so when the first publisher lands the path lights up end-to-end.
+
+#### Public surface
+
+- `netcortex/reflex/`
+  - `protocol.py` — `ReflexHandler` Protocol + frozen `ReflexOutcome`
+    dataclass + `Severity` / `OutcomeKind` literal types. Severity is a
+    four-bucket scale (`info | warn | high | critical`) so downstream
+    alerting can pattern-match without parsing free-form strings.
+  - `registry.py` — process-wide `register_handler()` / `get_handler()`
+    / `all_handlers()` / `clear_registry()`. Idempotent re-registration
+    of the same instance; duplicate-id collisions raise
+    `DuplicateHandlerError` (handler ids appear on every persisted
+    outcome — silent shadowing would be an operator footgun).
+  - `runner.py` — `ReflexRunner` wires the registry to one bus, spawns
+    one asyncio task per handler, isolates per-handler exceptions
+    (raising handler → `errored` outcome with truncated traceback in
+    `diagnostic`, dispatcher continues). Idempotent `start()` / `stop()`;
+    `ready_event` for tests that need cross-handler ordering.
+
+#### First-party handlers (idle until 0.8.0-dev3)
+
+| Handler id | Subject pattern | Severity | Notes |
+|---|---|---|---|
+| `link_down` | `sensory.snmp.trap.link_down.>` | `high` | Caps upstream key echo at 16 to bound outcome size |
+| `security_webhook` | `sensory.meraki.webhook.security.>` | from payload | Coarse Meraki→NetCortex severity map (`informational`/`warning`/`high`/`critical`) |
+| `bgp_drop` | `sensory.snmp.trap.bgp_backward_transition.>` | `high` | Target composed as `device|peer` when both are known, falls back gracefully |
+
+Each handler is intentionally minimal — it captures the event, extracts
+a target, returns a `logged` outcome. The richer behavior (semantic
+memory lookup, maintenance-window check, dedup, NetBox journal mirror)
+lands in later sub-steps once the first publisher exists to drive it.
+
+#### Tests
+
+- `tests/reflex/test_registry.py` — 7 cases: register/lookup, insertion
+  ordering, duplicate rejection, idempotent re-register, type rejection,
+  missing-key, clear. Uses a save/restore fixture so it does not leak the
+  cleared state to sibling test files.
+- `tests/reflex/test_runner.py` — 8 cases against `InMemoryEventBus`:
+  dispatch matching events, pattern-filter non-matching, fan-out to
+  multiple handlers, exception isolation (`errored` outcome continues
+  dispatcher), `None` outcome not recorded, idempotent start/stop,
+  stop-without-start safety, registry enumeration default-arg path.
+- `tests/reflex/test_handlers.py` — 14 cases pinning the operator-facing
+  surface (handler id + subscription pattern) and exercising each
+  handler's outcome-shape contract + target-extraction fallbacks.
+
+### Not yet wired
+
+- Still no publishers. Pollers continue to call correlator + writeback
+  directly. The first dual-write publisher lands in `0.8.0-dev3`.
+- Outcomes are logged only — Neo4j `:ReflexEvent` persistence + NetBox
+  journal mirror land in `0.8.0-dev3` once the writer Protocols have a
+  consumer to justify them.
+
 ## [0.8.0-dev1] — 2026-06-01
 
 ### Added — Thalamus: NATS-backed event bus lands

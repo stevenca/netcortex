@@ -1,0 +1,241 @@
+"""End-to-end tests for :class:`ReflexRunner`.
+
+Exercise the runner against the in-memory event bus so dispatch is
+deterministic without standing up NATS. The in-memory bus implements the
+same Protocol, so passing here means the runner will behave identically
+against the production NATS backend (verified by the contract suite that
+NATS satisfies that Protocol).
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timezone
+from typing import Any, Final
+
+import pytest
+
+from netcortex.contracts.event_bus import EventBus, EventMessage
+from netcortex.reflex.protocol import ReflexOutcome
+from netcortex.reflex.runner import ReflexRunner
+from tests.contracts.event_bus.in_memory import InMemoryEventBus
+
+pytestmark = pytest.mark.asyncio
+
+
+def _bus() -> EventBus:
+    return InMemoryEventBus()
+
+
+class _RecordingHandler:
+    """Handler that records every event it sees for test introspection."""
+
+    def __init__(self, hid: str, pattern: str) -> None:
+        self.id: Final[str] = hid
+        self.pattern: Final[str] = pattern
+        self.seen: list[EventMessage] = []
+
+    async def handle(self, event: EventMessage) -> ReflexOutcome | None:
+        self.seen.append(event)
+        return ReflexOutcome(
+            handler=self.id,
+            subject=event.subject,
+            target=str(event.payload.get("target") or "") or None,
+            severity="info",
+            occurred_at=datetime.now(tz=timezone.utc),
+            payload=dict(event.payload),
+        )
+
+
+class _RaisingHandler:
+    """Handler that raises — used to verify per-handler isolation."""
+
+    id: Final[str] = "boom"
+    pattern: Final[str] = "sensory.boom.>"
+
+    async def handle(self, event: EventMessage) -> ReflexOutcome | None:
+        raise RuntimeError("simulated handler failure")
+
+
+class _SkippingHandler:
+    """Handler that returns ``None`` — used to verify None-skips-recording."""
+
+    id: Final[str] = "skip"
+    pattern: Final[str] = "sensory.skip.>"
+
+    async def handle(self, event: EventMessage) -> ReflexOutcome | None:
+        return None
+
+
+async def _wait_for(predicate: Any, timeout: float = 1.5) -> None:
+    """Poll until ``predicate()`` is truthy or timeout. Better than fixed sleep."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("predicate did not become true within timeout")
+
+
+async def test_dispatches_event_to_matching_handler() -> None:
+    bus = _bus()
+    handler = _RecordingHandler("link_down", "sensory.snmp.trap.link_down.>")
+    runner = ReflexRunner(bus, handlers=[handler])
+    await runner.start()
+    try:
+        await asyncio.sleep(0.05)  # let subscription register
+        await bus.publish(
+            "sensory.snmp.trap.link_down.r1",
+            {"interface": "Gi0/1", "target": "r1"},
+        )
+        await _wait_for(lambda: len(handler.seen) == 1)
+    finally:
+        await runner.stop()
+        await bus.close()
+
+    assert handler.seen[0].subject == "sensory.snmp.trap.link_down.r1"
+    assert handler.seen[0].payload == {"interface": "Gi0/1", "target": "r1"}
+    assert len(runner.outcomes) == 1
+    outcome = runner.outcomes[0]
+    assert outcome.handler == "link_down"
+    assert outcome.target == "r1"
+
+
+async def test_pattern_filters_out_non_matching_events() -> None:
+    bus = _bus()
+    handler = _RecordingHandler("only_a", "sensory.a.>")
+    runner = ReflexRunner(bus, handlers=[handler])
+    await runner.start()
+    try:
+        await asyncio.sleep(0.05)
+        await bus.publish("sensory.a.event", {"i": 0})
+        await bus.publish("sensory.b.event", {"i": 1})  # must NOT match
+        await bus.publish("sensory.a.deeper.event", {"i": 2})
+        # Give the bus time to deliver any non-matching events too (and
+        # have them be filtered out, not silently delivered).
+        await _wait_for(lambda: len(handler.seen) == 2)
+    finally:
+        await runner.stop()
+        await bus.close()
+
+    assert sorted(e.payload["i"] for e in handler.seen) == [0, 2]
+
+
+async def test_multiple_handlers_fan_out() -> None:
+    """One event whose subject matches two handlers reaches both."""
+    bus = _bus()
+    a = _RecordingHandler("a", "sensory.shared.>")
+    b = _RecordingHandler("b", "sensory.shared.>")
+    runner = ReflexRunner(bus, handlers=[a, b])
+    await runner.start()
+    try:
+        await asyncio.sleep(0.05)
+        await bus.publish("sensory.shared.event", {"i": 0})
+        await _wait_for(lambda: len(a.seen) == 1 and len(b.seen) == 1)
+    finally:
+        await runner.stop()
+        await bus.close()
+
+
+async def test_handler_exception_does_not_kill_dispatcher() -> None:
+    """A raising handler produces an ``errored`` outcome and keeps going."""
+    bus = _bus()
+    boom = _RaisingHandler()
+    runner = ReflexRunner(bus, handlers=[boom])
+    await runner.start()
+    try:
+        await asyncio.sleep(0.05)
+        await bus.publish("sensory.boom.event", {"n": 1})
+        await bus.publish("sensory.boom.event", {"n": 2})
+        await _wait_for(lambda: len(runner.outcomes) == 2)
+    finally:
+        await runner.stop()
+        await bus.close()
+
+    assert all(o.outcome == "errored" for o in runner.outcomes)
+    assert all("RuntimeError" in o.rationale for o in runner.outcomes)
+    # Diagnostic carries a traceback for debugging.
+    assert "traceback" in runner.outcomes[0].diagnostic
+    assert (
+        "simulated handler failure" in runner.outcomes[0].diagnostic["traceback"]
+    )
+
+
+async def test_none_outcome_is_not_recorded() -> None:
+    """``handle() -> None`` is a conscious no-op, NOT an error."""
+    bus = _bus()
+    handler = _SkippingHandler()
+    runner = ReflexRunner(bus, handlers=[handler])
+    await runner.start()
+    try:
+        await asyncio.sleep(0.05)
+        await bus.publish("sensory.skip.event", {})
+        # Wait long enough that, if an outcome were going to be recorded,
+        # it would have been. Then assert it was not.
+        await asyncio.sleep(0.2)
+    finally:
+        await runner.stop()
+        await bus.close()
+
+    assert runner.outcomes == []
+
+
+async def test_start_is_idempotent() -> None:
+    bus = _bus()
+    handler = _RecordingHandler("x", "sensory.x.>")
+    runner = ReflexRunner(bus, handlers=[handler])
+    await runner.start()
+    await runner.start()  # second call must be a no-op
+    try:
+        # The handler list is one task, not two.
+        assert len([t for t in runner._tasks if not t.done()]) == 1  # noqa: SLF001
+    finally:
+        await runner.stop()
+        await bus.close()
+
+
+async def test_stop_is_idempotent() -> None:
+    bus = _bus()
+    runner = ReflexRunner(
+        bus, handlers=[_RecordingHandler("x", "sensory.x.>")]
+    )
+    await runner.start()
+    await runner.stop()
+    await runner.stop()  # second call must be a no-op
+    await bus.close()
+
+
+async def test_stop_without_start_is_safe() -> None:
+    """Calling stop on a runner that never started is a no-op."""
+    bus = _bus()
+    runner = ReflexRunner(bus, handlers=[_RecordingHandler("x", "sensory.x.>")])
+    await runner.stop()
+    await bus.close()
+
+
+async def test_runner_enumerates_registry_when_no_handlers_given() -> None:
+    """Default-argument path: the runner reads the registry."""
+    from netcortex.reflex.registry import (
+        all_handlers,
+        clear_registry,
+        register_handler,
+    )
+
+    # Snapshot the production registry so we don't leak the cleared state
+    # to sibling test files that depend on the first-party handlers.
+    snapshot = list(all_handlers())
+    clear_registry()
+    try:
+        a = _RecordingHandler("reg-a", "sensory.reg.>")
+        b = _RecordingHandler("reg-b", "sensory.reg.>")
+        register_handler(a)
+        register_handler(b)
+        bus = _bus()
+        runner = ReflexRunner(bus)
+        assert {h.id for h in runner.handlers} == {"reg-a", "reg-b"}
+        await runner.stop()
+        await bus.close()
+    finally:
+        clear_registry()
+        for h in snapshot:
+            register_handler(h)
