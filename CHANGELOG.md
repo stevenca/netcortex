@@ -24,7 +24,12 @@ and this file MUST be updated together whenever `__version__` changes.
 
 ---
 
-## [0.8.0-dev3.1] — Deployment-safety follow-up
+## [0.8.0-dev4] — Deployment-safety: NetBox writeback dry-run knob
+
+> Note: dev4 was originally planned for the first SensoryEvent publisher.
+> That work shifts to dev5; this slot was reused for a deployment-safety
+> follow-up to dev3 (PEP 440 doesn't allow `dev3.1` post-release suffixes
+> on a dev release, so we step the dev counter instead).
 
 ### Added
 - `Settings.netbox_writeback_dry_run` config knob, sourced from either:
