@@ -5,6 +5,12 @@ deterministic without standing up NATS. The in-memory bus implements the
 same Protocol, so passing here means the runner will behave identically
 against the production NATS backend (verified by the contract suite that
 NATS satisfies that Protocol).
+
+In dev3 the runner threads a :class:`ReflexContext` to every handler
+call. These tests pin the wiring: default-context path (no context
+supplied → empty context), explicit-context path (with a dedup store
+that the handler can consult), and the unchanged failure-isolation /
+lifecycle behavior.
 """
 
 from __future__ import annotations
@@ -16,8 +22,9 @@ from typing import Any, Final
 import pytest
 
 from netcortex.contracts.event_bus import EventBus, EventMessage
-from netcortex.reflex.protocol import ReflexOutcome
+from netcortex.reflex.protocol import ReflexContext, ReflexOutcome
 from netcortex.reflex.runner import ReflexRunner
+from netcortex.working.dedup import InMemoryDedupStore
 from tests.contracts.event_bus.in_memory import InMemoryEventBus
 
 pytestmark = pytest.mark.asyncio
@@ -28,15 +35,23 @@ def _bus() -> EventBus:
 
 
 class _RecordingHandler:
-    """Handler that records every event it sees for test introspection."""
+    """Handler that records every event it sees for test introspection.
+
+    Also records the context it received so tests can confirm the runner
+    threaded a non-default context through.
+    """
 
     def __init__(self, hid: str, pattern: str) -> None:
         self.id: Final[str] = hid
         self.pattern: Final[str] = pattern
         self.seen: list[EventMessage] = []
+        self.contexts: list[ReflexContext] = []
 
-    async def handle(self, event: EventMessage) -> ReflexOutcome | None:
+    async def handle(
+        self, event: EventMessage, ctx: ReflexContext
+    ) -> ReflexOutcome | None:
         self.seen.append(event)
+        self.contexts.append(ctx)
         return ReflexOutcome(
             handler=self.id,
             subject=event.subject,
@@ -51,9 +66,11 @@ class _RaisingHandler:
     """Handler that raises — used to verify per-handler isolation."""
 
     id: Final[str] = "boom"
-    pattern: Final[str] = "sensory.boom.>"
+    pattern: Final[str] = "sensory.link_down.test_src.boom"
 
-    async def handle(self, event: EventMessage) -> ReflexOutcome | None:
+    async def handle(
+        self, event: EventMessage, ctx: ReflexContext
+    ) -> ReflexOutcome | None:
         raise RuntimeError("simulated handler failure")
 
 
@@ -61,9 +78,11 @@ class _SkippingHandler:
     """Handler that returns ``None`` — used to verify None-skips-recording."""
 
     id: Final[str] = "skip"
-    pattern: Final[str] = "sensory.skip.>"
+    pattern: Final[str] = "sensory.link_up.test_src.skip"
 
-    async def handle(self, event: EventMessage) -> ReflexOutcome | None:
+    async def handle(
+        self, event: EventMessage, ctx: ReflexContext
+    ) -> ReflexOutcome | None:
         return None
 
 
@@ -79,13 +98,13 @@ async def _wait_for(predicate: Any, timeout: float = 1.5) -> None:
 
 async def test_dispatches_event_to_matching_handler() -> None:
     bus = _bus()
-    handler = _RecordingHandler("link_down", "sensory.snmp.trap.link_down.>")
+    handler = _RecordingHandler("link_down", "sensory.link_down.>")
     runner = ReflexRunner(bus, handlers=[handler])
     await runner.start()
     try:
-        await asyncio.sleep(0.05)  # let subscription register
+        await asyncio.sleep(0.05)
         await bus.publish(
-            "sensory.snmp.trap.link_down.r1",
+            "sensory.link_down.snmp_trap.r1|Gi0/1",
             {"interface": "Gi0/1", "target": "r1"},
         )
         await _wait_for(lambda: len(handler.seen) == 1)
@@ -93,7 +112,7 @@ async def test_dispatches_event_to_matching_handler() -> None:
         await runner.stop()
         await bus.close()
 
-    assert handler.seen[0].subject == "sensory.snmp.trap.link_down.r1"
+    assert handler.seen[0].subject == "sensory.link_down.snmp_trap.r1|Gi0/1"
     assert handler.seen[0].payload == {"interface": "Gi0/1", "target": "r1"}
     assert len(runner.outcomes) == 1
     outcome = runner.outcomes[0]
@@ -103,16 +122,14 @@ async def test_dispatches_event_to_matching_handler() -> None:
 
 async def test_pattern_filters_out_non_matching_events() -> None:
     bus = _bus()
-    handler = _RecordingHandler("only_a", "sensory.a.>")
+    handler = _RecordingHandler("only_link_down", "sensory.link_down.>")
     runner = ReflexRunner(bus, handlers=[handler])
     await runner.start()
     try:
         await asyncio.sleep(0.05)
-        await bus.publish("sensory.a.event", {"i": 0})
-        await bus.publish("sensory.b.event", {"i": 1})  # must NOT match
-        await bus.publish("sensory.a.deeper.event", {"i": 2})
-        # Give the bus time to deliver any non-matching events too (and
-        # have them be filtered out, not silently delivered).
+        await bus.publish("sensory.link_down.snmp_trap.r1", {"i": 0})
+        await bus.publish("sensory.link_up.snmp_trap.r1", {"i": 1})  # not match
+        await bus.publish("sensory.link_down.meraki_webhook.r2", {"i": 2})
         await _wait_for(lambda: len(handler.seen) == 2)
     finally:
         await runner.stop()
@@ -124,13 +141,13 @@ async def test_pattern_filters_out_non_matching_events() -> None:
 async def test_multiple_handlers_fan_out() -> None:
     """One event whose subject matches two handlers reaches both."""
     bus = _bus()
-    a = _RecordingHandler("a", "sensory.shared.>")
-    b = _RecordingHandler("b", "sensory.shared.>")
+    a = _RecordingHandler("a", "sensory.link_down.>")
+    b = _RecordingHandler("b", "sensory.link_down.>")
     runner = ReflexRunner(bus, handlers=[a, b])
     await runner.start()
     try:
         await asyncio.sleep(0.05)
-        await bus.publish("sensory.shared.event", {"i": 0})
+        await bus.publish("sensory.link_down.snmp_trap.r1", {"i": 0})
         await _wait_for(lambda: len(a.seen) == 1 and len(b.seen) == 1)
     finally:
         await runner.stop()
@@ -145,8 +162,8 @@ async def test_handler_exception_does_not_kill_dispatcher() -> None:
     await runner.start()
     try:
         await asyncio.sleep(0.05)
-        await bus.publish("sensory.boom.event", {"n": 1})
-        await bus.publish("sensory.boom.event", {"n": 2})
+        await bus.publish("sensory.link_down.test_src.boom", {"n": 1})
+        await bus.publish("sensory.link_down.test_src.boom", {"n": 2})
         await _wait_for(lambda: len(runner.outcomes) == 2)
     finally:
         await runner.stop()
@@ -154,7 +171,6 @@ async def test_handler_exception_does_not_kill_dispatcher() -> None:
 
     assert all(o.outcome == "errored" for o in runner.outcomes)
     assert all("RuntimeError" in o.rationale for o in runner.outcomes)
-    # Diagnostic carries a traceback for debugging.
     assert "traceback" in runner.outcomes[0].diagnostic
     assert (
         "simulated handler failure" in runner.outcomes[0].diagnostic["traceback"]
@@ -169,9 +185,7 @@ async def test_none_outcome_is_not_recorded() -> None:
     await runner.start()
     try:
         await asyncio.sleep(0.05)
-        await bus.publish("sensory.skip.event", {})
-        # Wait long enough that, if an outcome were going to be recorded,
-        # it would have been. Then assert it was not.
+        await bus.publish("sensory.link_up.test_src.skip", {})
         await asyncio.sleep(0.2)
     finally:
         await runner.stop()
@@ -182,12 +196,11 @@ async def test_none_outcome_is_not_recorded() -> None:
 
 async def test_start_is_idempotent() -> None:
     bus = _bus()
-    handler = _RecordingHandler("x", "sensory.x.>")
+    handler = _RecordingHandler("x", "sensory.link_down.>")
     runner = ReflexRunner(bus, handlers=[handler])
     await runner.start()
-    await runner.start()  # second call must be a no-op
+    await runner.start()
     try:
-        # The handler list is one task, not two.
         assert len([t for t in runner._tasks if not t.done()]) == 1  # noqa: SLF001
     finally:
         await runner.stop()
@@ -197,18 +210,18 @@ async def test_start_is_idempotent() -> None:
 async def test_stop_is_idempotent() -> None:
     bus = _bus()
     runner = ReflexRunner(
-        bus, handlers=[_RecordingHandler("x", "sensory.x.>")]
+        bus, handlers=[_RecordingHandler("x", "sensory.link_down.>")]
     )
     await runner.start()
     await runner.stop()
-    await runner.stop()  # second call must be a no-op
+    await runner.stop()
     await bus.close()
 
 
 async def test_stop_without_start_is_safe() -> None:
     """Calling stop on a runner that never started is a no-op."""
     bus = _bus()
-    runner = ReflexRunner(bus, handlers=[_RecordingHandler("x", "sensory.x.>")])
+    runner = ReflexRunner(bus, handlers=[_RecordingHandler("x", "sensory.link_down.>")])
     await runner.stop()
     await bus.close()
 
@@ -221,13 +234,11 @@ async def test_runner_enumerates_registry_when_no_handlers_given() -> None:
         register_handler,
     )
 
-    # Snapshot the production registry so we don't leak the cleared state
-    # to sibling test files that depend on the first-party handlers.
     snapshot = list(all_handlers())
     clear_registry()
     try:
-        a = _RecordingHandler("reg-a", "sensory.reg.>")
-        b = _RecordingHandler("reg-b", "sensory.reg.>")
+        a = _RecordingHandler("reg-a", "sensory.link_down.>")
+        b = _RecordingHandler("reg-b", "sensory.link_up.>")
         register_handler(a)
         register_handler(b)
         bus = _bus()
@@ -239,3 +250,47 @@ async def test_runner_enumerates_registry_when_no_handlers_given() -> None:
         clear_registry()
         for h in snapshot:
             register_handler(h)
+
+
+# ---------------------------------------------------------------------------
+# ReflexContext threading (dev3)
+# ---------------------------------------------------------------------------
+
+
+async def test_default_context_has_no_dedup_store() -> None:
+    """Runners built without an explicit context still pass one through."""
+    bus = _bus()
+    handler = _RecordingHandler("ctx_default", "sensory.link_down.>")
+    runner = ReflexRunner(bus, handlers=[handler])
+    await runner.start()
+    try:
+        await asyncio.sleep(0.05)
+        await bus.publish("sensory.link_down.snmp_trap.r1", {})
+        await _wait_for(lambda: len(handler.contexts) == 1)
+    finally:
+        await runner.stop()
+        await bus.close()
+
+    assert isinstance(handler.contexts[0], ReflexContext)
+    assert handler.contexts[0].dedup_store is None
+
+
+async def test_explicit_context_is_threaded_to_handler() -> None:
+    """A context passed to ReflexRunner reaches every handle() call."""
+    bus = _bus()
+    handler = _RecordingHandler("ctx_explicit", "sensory.link_down.>")
+    store = InMemoryDedupStore()
+    ctx = ReflexContext(dedup_store=store)
+    runner = ReflexRunner(bus, handlers=[handler], context=ctx)
+    try:
+        assert runner.context is ctx
+        await runner.start()
+        await asyncio.sleep(0.05)
+        await bus.publish("sensory.link_down.snmp_trap.r1", {})
+        await _wait_for(lambda: len(handler.contexts) == 1)
+        assert handler.contexts[0] is ctx
+        assert handler.contexts[0].dedup_store is store
+    finally:
+        await runner.stop()
+        await store.close()
+        await bus.close()

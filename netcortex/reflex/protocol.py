@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal, Protocol, runtime_checkable
 
+from netcortex.contracts.dedup_store import DedupStore
 from netcortex.contracts.event_bus import EventMessage
 
 Severity = Literal["info", "warn", "high", "critical"]
@@ -101,6 +102,36 @@ class ReflexOutcome:
     used). Not surfaced in the operator UI by default."""
 
 
+@dataclass(frozen=True)
+class ReflexContext:
+    """Runtime dependencies a handler may use during ``handle()``.
+
+    Threaded through by the :class:`netcortex.reflex.runner.ReflexRunner`
+    so handlers can consult shared resources (the dedup store today;
+    semantic memory, working memory, and the policy engine in later
+    releases) without each one carrying its own constructor wiring.
+
+    Frozen so a handler cannot replace another handler's view of the
+    world mid-dispatch. New shared resources are added by appending
+    fields here; handlers that don't consume them are unaffected. That
+    forward-compatibility is the whole point of using a context dataclass
+    rather than positional arguments.
+
+    All fields default to ``None`` so the runner can be constructed
+    without ever wiring a context (the default-context path) and tests
+    can pass partial contexts that exercise only the resources they
+    care about.
+    """
+
+    dedup_store: DedupStore | None = None
+    """If set, handlers should consult it via
+    :meth:`DedupStore.record_unless_duplicate` to suppress duplicate
+    arrivals of the same logical event (e.g. trap + webhook + poll all
+    observing one interface going down). Handlers that opt out of dedup
+    — because their event class is inherently de-duplicated upstream —
+    may ignore this field."""
+
+
 @runtime_checkable
 class ReflexHandler(Protocol):
     """Minimum surface every reflex handler must expose.
@@ -126,11 +157,21 @@ class ReflexHandler(Protocol):
 
         Validated by the runner against the same grammar
         :class:`netcortex.thalamus.NatsEventBus` enforces. One pattern per
-        handler in 0.8.0-dev2.
+        handler in 0.8.0-dev3.
+
+        Patterns follow the event-class-first taxonomy documented in
+        ``docs/architecture/subjects.md`` —
+        ``sensory.<event_class>.<source>.<target...>`` —  so a single
+        wildcard like ``sensory.link_down.>`` catches every source of a
+        link-down observation.
         """
         ...
 
-    async def handle(self, event: EventMessage) -> ReflexOutcome | None:
+    async def handle(
+        self,
+        event: EventMessage,
+        ctx: ReflexContext,
+    ) -> ReflexOutcome | None:
         """Process one event.
 
         Returning :class:`ReflexOutcome` instructs the runner to log /
@@ -141,5 +182,14 @@ class ReflexHandler(Protocol):
         way to silently skip an error — raise instead, and the runner
         will convert it to an ``errored`` outcome with the traceback in
         ``diagnostic``.
+
+        ``ctx`` carries shared runtime resources (dedup store and, in
+        later releases, semantic memory / working memory / policy). A
+        handler that consults the dedup store and finds the event is a
+        duplicate SHOULD return a ``ReflexOutcome`` with
+        ``outcome="skipped"`` and a ``rationale`` naming the dedup
+        window — the skipped outcome is itself useful telemetry
+        (corroboration count, visibility gaps) so the runner persists
+        it the same as any other outcome.
         """
         ...

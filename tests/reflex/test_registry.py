@@ -14,7 +14,7 @@ from typing import Final
 import pytest
 
 from netcortex.contracts.event_bus import EventMessage
-from netcortex.reflex.protocol import ReflexOutcome
+from netcortex.reflex.protocol import ReflexContext, ReflexOutcome
 from netcortex.reflex.registry import (
     DuplicateHandlerError,
     all_handlers,
@@ -27,11 +27,13 @@ from netcortex.reflex.registry import (
 class _StubHandler:
     """Minimal structural ReflexHandler used by these tests."""
 
-    def __init__(self, hid: str, pattern: str = "test.>") -> None:
+    def __init__(self, hid: str, pattern: str = "sensory.test.test_src.test") -> None:
         self.id: Final[str] = hid
         self.pattern: Final[str] = pattern
 
-    async def handle(self, event: EventMessage) -> ReflexOutcome | None:
+    async def handle(
+        self, event: EventMessage, ctx: ReflexContext
+    ) -> ReflexOutcome | None:
         return ReflexOutcome(
             handler=self.id,
             subject=event.subject,
@@ -63,7 +65,6 @@ def _isolated_registry():
 def test_register_and_lookup() -> None:
     h = _StubHandler("alpha")
     returned = register_handler(h)
-    # Decorator-style usage returns the handler unchanged.
     assert returned is h
     assert get_handler("alpha") is h
     assert list(all_handlers()) == [h]
@@ -81,19 +82,11 @@ def test_register_duplicate_id_raises() -> None:
     register_handler(_StubHandler("dup"))
     with pytest.raises(DuplicateHandlerError) as ei:
         register_handler(_StubHandler("dup"))
-    # Error message names BOTH handler classes so the operator can find
-    # the offending file quickly. We do not pin the exact message; only
-    # that the registered id appears in it.
     assert "dup" in str(ei.value)
 
 
 def test_register_same_instance_is_idempotent() -> None:
-    """Re-registering the exact same instance is a no-op.
-
-    Modules can be imported twice in the same process (test suite
-    isolation, plugin auto-discovery), so the registry treats an
-    identical re-register as the harmless event it is.
-    """
+    """Re-registering the exact same instance is a no-op."""
     h = _StubHandler("same")
     register_handler(h)
     register_handler(h)
@@ -104,7 +97,6 @@ def test_register_rejects_non_handler() -> None:
     """Registration is type-checked at registration time."""
 
     class NotAHandler:
-        # Missing handle(), pattern, id.
         pass
 
     with pytest.raises(TypeError):
