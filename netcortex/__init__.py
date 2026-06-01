@@ -22,4 +22,4 @@ The version source of truth is this module. ``pyproject.toml`` and the
 ``CHANGELOG.md`` MUST be kept in sync whenever ``__version__`` changes.
 """
 
-__version__ = "0.8.0-dev3"
+__version__ = "0.8.0-dev4"

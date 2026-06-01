@@ -624,10 +624,14 @@ async def _netbox_writeback_loop(cfg, interval: int = 1800) -> None:
                 cfg.netbox_url,
                 cfg.netbox_token,
                 verify_ssl=cfg.netbox_verify_ssl,
-                dry_run=False,
+                dry_run=cfg.netbox_writeback_dry_run,
             )
             summary = report.get("summary", {})
-            log.info("worker.netbox_writeback_done", **summary)
+            log.info(
+                "worker.netbox_writeback_done",
+                dry_run=cfg.netbox_writeback_dry_run,
+                **summary,
+            )
         except Exception as exc:
             log.error("worker.netbox_writeback_failed", error=str(exc))
 

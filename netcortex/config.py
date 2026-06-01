@@ -97,6 +97,13 @@ class Settings:
     netbox_url: str
     netbox_token: str
     netbox_verify_ssl: bool
+    # When true, the worker's NetBox writeback loop computes the full diff but
+    # short-circuits every PATCH/POST/DELETE. The resulting `report` still lists
+    # every intended change with `dry_run=True` on each entry, which is useful
+    # for verifying a new release against a live NetBox without modifying it.
+    # Override with NETBOX_WRITEBACK_DRY_RUN=1 or core-secret
+    # `netbox_writeback_dry_run=true`.
+    netbox_writeback_dry_run: bool
 
     # Neo4j graph database
     neo4j_uri: str
@@ -189,6 +196,13 @@ class Settings:
             self.netbox_verify_ssl = _verify_env.strip().lower() in {
                 "1", "true", "yes", "on",
             }
+        _dry_env = os.environ.get("NETBOX_WRITEBACK_DRY_RUN")
+        if _dry_env is None:
+            self.netbox_writeback_dry_run = False
+        else:
+            self.netbox_writeback_dry_run = _dry_env.strip().lower() in {
+                "1", "true", "yes", "on",
+            }
         self.sync_backend = "apscheduler"
         self.sync_conflict_policy = "alert"
         self.sync_interval = 300                    # global default: 5 min
@@ -247,6 +261,13 @@ class Settings:
             }
         else:
             self.netbox_verify_ssl = bool(raw_verify_ssl)
+        raw_dry_run = core.get("netbox_writeback_dry_run", self.netbox_writeback_dry_run)
+        if isinstance(raw_dry_run, str):
+            self.netbox_writeback_dry_run = raw_dry_run.strip().lower() in {
+                "1", "true", "yes", "on",
+            }
+        else:
+            self.netbox_writeback_dry_run = bool(raw_dry_run)
 
         # Optional keys with defaults
         self.neo4j_uri = core.get("neo4j_uri", self.neo4j_uri)
