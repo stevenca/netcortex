@@ -302,10 +302,20 @@ async def _merge_reflex_event_tx(tx: Any, props: dict[str, Any], device_name: st
         # Best-effort AFFECTS edge. We MATCH-only (not MERGE) the device
         # so we don't create stub nodes from a typo'd device name in a
         # reflex event — the live state graph stays canonical.
+        #
+        # We match on three identifiers: human name, platform_id (vendor
+        # serial / network id), and node id. The dev6 deploy revealed that
+        # SNMP-sourced events sometimes carry the node-id form
+        # (e.g. ``meraki:Q4CD-Y6FW-EKVS``) as the device half of the
+        # target. Adding ``d.id`` to the OR catches those without needing
+        # the publisher to know which form Neo4j keyed the device on.
         await tx.run(
             """
             MATCH (e:ReflexEvent {id: $event_id})
-            MATCH (d:Device) WHERE d.name = $device_name OR d.platform_id = $device_name
+            MATCH (d:Device)
+            WHERE d.name = $device_name
+               OR d.platform_id = $device_name
+               OR d.id = $device_name
             MERGE (e)-[:AFFECTS]->(d)
             """,
             event_id=event_id,

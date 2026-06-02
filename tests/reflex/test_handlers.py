@@ -101,6 +101,49 @@ async def test_link_down_extracts_device_and_interface() -> None:
     assert outcome.outcome == "logged"
 
 
+async def test_link_down_prefers_device_over_device_id() -> None:
+    """Caught in the dev6 deploy verification: when both ``device`` (human
+    name) and ``device_id`` (Neo4j node id) are present in the payload,
+    the handler must prefer ``device`` so the target string matches the
+    subject token built by the publisher.
+
+    Concretely: the SNMP publisher emits
+    ``sensory.link_down.snmp_poll.cpn-nash-ms130-1|Port_9`` (subject) with
+    payload ``{device: 'cpn-nash-ms130-1', device_id: 'meraki:Q4CD-...'}``.
+    If the handler picks ``device_id``, the resulting target is
+    ``'meraki:Q4CD-...|Port 9'`` which doesn't line up with the subject
+    and confuses the AFFECTS edge resolver in the Neo4j sink.
+    """
+    h = get_handler("link_down")
+    outcome = await h.handle(
+        _event(
+            "sensory.link_down.snmp_poll.cpn-nash-ms130-1|Port_9",
+            {
+                "device": "cpn-nash-ms130-1",
+                "device_id": "meraki:Q4CD-Y6FW-EKVS",
+                "interface": "Port 9",
+            },
+        ),
+        _empty_ctx(),
+    )
+    assert outcome is not None
+    assert outcome.target == "cpn-nash-ms130-1|Port 9"
+
+
+async def test_link_down_falls_back_to_device_id_when_device_absent() -> None:
+    """When only ``device_id`` is supplied (legacy publishers, traps), use it."""
+    h = get_handler("link_down")
+    outcome = await h.handle(
+        _event(
+            "sensory.link_down.snmp_trap.r1",
+            {"device_id": "r1", "interface": "Gi0/1"},
+        ),
+        _empty_ctx(),
+    )
+    assert outcome is not None
+    assert outcome.target == "r1|Gi0/1"
+
+
 async def test_link_down_handles_missing_target_field() -> None:
     """No device field at all — outcome.target is None."""
     h = get_handler("link_down")
