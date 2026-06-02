@@ -24,6 +24,48 @@ and this file MUST be updated together whenever `__version__` changes.
 
 ---
 
+## [0.8.0-dev7] — :AFFECTS edge resolution + target/subject consistency
+
+Second small polish to the dev5 pipeline, surfaced by deployment
+verification. The dev5 deploy produced 31 `:ReflexEvent` nodes (real
+data, including 28 from Meraki MS switches after the dev6 fix landed),
+but none of them connected to their `:Device` nodes via `:AFFECTS`.
+
+Root cause: the `link_down` handler was preferring `payload["device_id"]`
+over `payload["device"]`, which produced targets like
+`'meraki:Q4CD-Y6FW-EKVS|Port 9'` — a Neo4j node-id form that no Device
+node had as its `name` or `platform_id`.
+
+### Changed
+- `link_down` handler now prefers `payload["device"]` (human name) over
+  `payload["device_id"]` so the target string matches the subject token
+  built by the publisher. Falls back to `device_id` when `device` is
+  absent (legacy publishers, traps).
+- `Neo4jReflexEventSink._merge_reflex_event_tx` AFFECTS-edge MATCH now
+  resolves devices on three identifiers: `d.name`, `d.platform_id`,
+  AND `d.id` — the latter catches node-id-form targets if a future
+  publisher emits them.
+
+### Tests
+- Two new cases in `tests/reflex/test_handlers.py` covering both
+  ordering preferences (device > device_id, fallback when device absent).
+
+### Operational note
+After deploying, new `:ReflexEvent` nodes will get `:AFFECTS` edges to
+their devices. The 31 existing nodes can be backfilled with this
+Cypher once dev7 is live:
+
+```cypher
+MATCH (e:ReflexEvent) WHERE NOT (e)-[:AFFECTS]->(:Device)
+WITH e, split(e.target, '|')[0] AS device_key
+MATCH (d:Device)
+WHERE d.name = device_key OR d.platform_id = device_key OR d.id = device_key
+MERGE (e)-[:AFFECTS]->(d)
+RETURN count(*) AS backfilled
+```
+
+---
+
 ## [0.8.0-dev6] — Sanitize whitespace in NATS subject target parts
 
 Hot-fix to dev5, caught within seconds of the dev5 deploy on

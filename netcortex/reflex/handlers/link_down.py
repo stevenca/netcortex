@@ -57,9 +57,16 @@ class LinkDownHandler:
         event_class, source, _target_from_subject = parse_sensory_subject(
             event.subject
         )
+        # Prefer the human-readable device name when present so the target
+        # string matches the subject token built by the publisher (which
+        # also uses the name). Falling back to device_id is fine for graph
+        # lookups — the Neo4j sink matches on both Device.name and
+        # Device.id when wiring the :AFFECTS edge. Caught in the dev6
+        # deploy: handler was preferring device_id, producing targets like
+        # 'meraki:Q4CD-Y6FW-EKVS|Port 9' that no devices were named.
         device = (
-            payload.get("device_id")
-            or payload.get("device")
+            payload.get("device")
+            or payload.get("device_id")
             or payload.get("target")
         )
         interface = payload.get("interface") or payload.get("if_name")
