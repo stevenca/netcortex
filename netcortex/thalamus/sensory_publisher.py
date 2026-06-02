@@ -9,6 +9,11 @@ of conveniences on top:
   fails at startup not at runtime
 * tag the payload with ``recorded_at`` and ``source`` for downstream
   fusion / dedup without each publisher reinventing the same code
+* sanitize whitespace in target parts — vendor identifiers like Meraki's
+  ``"Port 3"`` interface names contain spaces, which NATS subjects
+  forbid. We replace each whitespace run with ``_`` so the subject is
+  valid and the original identifier is preserved in the payload's
+  ``interface``/``target`` field.
 * emit a structured ``bus.published`` log line so an operator can see the
   full event flow without a debugger
 * swallow-and-log errors so a transient NATS hiccup doesn't crash the
@@ -25,6 +30,7 @@ want to assert "this code path published these events" inject an
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -32,6 +38,25 @@ from netcortex.contracts.event_bus import EventBus
 from netcortex.contracts.subjects import SENSORY_SOURCES, sensory_subject
 
 _LOG = logging.getLogger(__name__)
+
+# Matches one-or-more whitespace characters. Whitespace in NATS subjects
+# is invalid; we collapse any run (regular space, tab, NBSP, etc.) to a
+# single ``_`` so vendor identifiers like "Port 3" or "Tunnel 1" become
+# valid subject tokens without losing the structure of the original
+# identifier (operators can still read "Port_3" and recognize "Port 3").
+_WHITESPACE_RUN = re.compile(r"\s+")
+
+
+def _sanitize_target_part(part: str) -> str:
+    """Make one target part NATS-subject-safe.
+
+    Currently only collapses whitespace runs to ``_``. Dots are a hard
+    programmer error (they are the NATS token separator and would split
+    the target across tokens), so we deliberately do NOT silently
+    replace them — the :func:`sensory_subject` validator catches them
+    and raises, which is what we want.
+    """
+    return _WHITESPACE_RUN.sub("_", part)
 
 
 class SensoryPublisher:
@@ -76,9 +101,13 @@ class SensoryPublisher:
 
         Programmer errors (unknown event_class, malformed target) raise
         immediately so they surface in unit tests rather than in
-        production logs.
+        production logs. Whitespace in target parts is **not** an error
+        — vendor identifiers commonly include spaces and we sanitize
+        them transparently. The original (un-sanitized) identifier is
+        preserved in the payload by the caller.
         """
-        subject = sensory_subject(event_class, self._source, *target_parts)
+        sanitized_parts = tuple(_sanitize_target_part(p) for p in target_parts)
+        subject = sensory_subject(event_class, self._source, *sanitized_parts)
         full_payload = dict(payload or {})
         # `source` echoed into the payload so downstream consumers that
         # don't parse the subject (or that re-emit on a derived subject)

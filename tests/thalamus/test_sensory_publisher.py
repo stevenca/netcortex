@@ -87,6 +87,78 @@ async def test_publish_swallows_bus_failure(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_publish_sanitizes_whitespace_in_target_parts() -> None:
+    """Vendor identifiers like Meraki's 'Port 3' must round-trip cleanly.
+
+    Real bug caught in the dev5 deploy: NATS subjects forbid whitespace,
+    so without sanitization every Meraki MS port (Port 1, Port 2, ...)
+    drops its link-state events. The publisher collapses whitespace runs
+    to '_' so the subject is valid; the payload retains the original
+    interface name for consumers that care about the human-readable form.
+    """
+    bus = InMemoryEventBus()
+    pub = SensoryPublisher(bus, source="snmp_poll")
+    seen: list[Any] = []
+
+    async def consume() -> None:
+        async for msg in bus.subscribe("sensory.link_down.>"):
+            seen.append(msg)
+            break
+
+    import asyncio
+    task = asyncio.create_task(consume())
+    await asyncio.sleep(0.01)
+
+    await pub.publish(
+        "link_down", "cpn-arlington-ms1|Port 3",
+        payload={"device": "cpn-arlington-ms1", "interface": "Port 3"},
+    )
+    await asyncio.wait_for(task, timeout=1.0)
+
+    assert seen[0].subject == "sensory.link_down.snmp_poll.cpn-arlington-ms1|Port_3"
+    # Original whitespace preserved in payload for human-readable display.
+    assert seen[0].payload["interface"] == "Port 3"
+
+
+@pytest.mark.asyncio
+async def test_publish_collapses_multiple_whitespace_runs() -> None:
+    """Tabs, NBSP, and multi-space runs all collapse to a single '_'."""
+    bus = InMemoryEventBus()
+    pub = SensoryPublisher(bus, source="snmp_poll")
+    seen: list[Any] = []
+
+    async def consume() -> None:
+        async for msg in bus.subscribe("sensory.link_down.>"):
+            seen.append(msg)
+            break
+
+    import asyncio
+    task = asyncio.create_task(consume())
+    await asyncio.sleep(0.01)
+
+    await pub.publish(
+        "link_down", "r1|MS130-  12X\tport",
+    )
+    await asyncio.wait_for(task, timeout=1.0)
+
+    assert seen[0].subject == "sensory.link_down.snmp_poll.r1|MS130-_12X_port"
+
+
+@pytest.mark.asyncio
+async def test_publish_still_rejects_dots_in_target_parts() -> None:
+    """Dots are the NATS token separator — they must remain a hard error.
+
+    Whitespace gets sanitized, dots do NOT. A caller passing 'a.b' as
+    one target part almost certainly meant 'a' and 'b' as two parts
+    and silently merging would mask the bug.
+    """
+    bus = InMemoryEventBus()
+    pub = SensoryPublisher(bus, source="snmp_poll")
+    with pytest.raises(ValueError, match="contains '.'"):
+        await pub.publish("link_down", "device.with.dots")
+
+
+@pytest.mark.asyncio
 async def test_publish_preserves_caller_supplied_source_and_recorded_at() -> None:
     """Caller-supplied source/recorded_at win over the defaults.
 
