@@ -32,6 +32,7 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 from netcortex.contracts.dedup_store import DedupStore
 from netcortex.contracts.event_bus import EventMessage
+from netcortex.contracts.reflex_event_sink import ReflexEventSink
 
 Severity = Literal["info", "warn", "high", "critical"]
 """Severity values understood by the persistence layer.
@@ -130,6 +131,18 @@ class ReflexContext:
     observing one interface going down). Handlers that opt out of dedup
     — because their event class is inherently de-duplicated upstream —
     may ignore this field."""
+
+    event_sink: ReflexEventSink | None = None
+    """If set, the :class:`~netcortex.reflex.runner.ReflexRunner` writes
+    every returned :class:`ReflexOutcome` (including ``skipped`` and
+    ``errored`` ones) to the sink. Handlers themselves do NOT need to
+    call the sink directly — the runner owns persistence so the body of
+    each handler stays a pure function ``(event, ctx) -> outcome``.
+
+    Provided on the context (rather than as a runner constructor arg)
+    so future custom handlers can take a different sink path when their
+    use case demands it (e.g. an alerting handler that writes to
+    OpenSearch in addition to the default Neo4j sink)."""
 
 
 @runtime_checkable

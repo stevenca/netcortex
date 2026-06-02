@@ -14,5 +14,6 @@ not become a runtime dependency of the package.
 """
 
 from netcortex.thalamus.nats_bus import NatsEventBus
+from netcortex.thalamus.sensory_publisher import SensoryPublisher
 
-__all__ = ["NatsEventBus"]
+__all__ = ["NatsEventBus", "SensoryPublisher"]

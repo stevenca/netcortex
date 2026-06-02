@@ -13,10 +13,13 @@ then the SNMP poll on its next 30-second pass. We collapse those to a
 single fire via the runner-supplied :class:`DedupStore`. Per-handler
 defaults documented in ``docs/architecture/subjects.md``.
 
-Dev2 was idle (no publishers). Dev3 wires the dedup contract but is
-still idle in terms of upstream publishers — the first real
-``sensory.link_down.snmp_poll.<target>`` publish lands in 0.8.0-dev4
-when the ingest worker starts dual-writing detected state changes.
+Dev2 was idle (no publishers). Dev3 wired the dedup contract but was
+still idle. **Dev5** wires the first real publisher (SNMP poller state-
+change emitter) AND attaches the Neo4j :class:`ReflexEventSink` to the
+runner context, so a returned :class:`ReflexOutcome` lands as a
+``:ReflexEvent`` node in episodic memory without the handler having to
+know anything about persistence. The handler stays a pure function
+``(event, ctx) -> outcome``.
 """
 
 from __future__ import annotations
@@ -111,7 +114,7 @@ class LinkDownHandler:
             outcome="logged",
             rationale=(
                 f"link_down on {target!r} from {source!r}; "
-                "dev3 dedup wired, no remediation yet"
+                "persisted to episodic memory"
             ),
         )
 

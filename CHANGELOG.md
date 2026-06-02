@@ -24,6 +24,126 @@ and this file MUST be updated together whenever `__version__` changes.
 
 ---
 
+## [0.8.0-dev5] — First sensory publisher: SNMP link-state → NATS → :ReflexEvent
+
+Closes the loop on the dev1–dev4 foundation. The bus has been live in
+production since the dev4 deploy but idle (no publishers, no consumers
+acting). Dev5 wires the **first end-to-end pipeline**:
+
+```
+SNMP poll  →  NATS subject  →  link_down reflex handler  →  Neo4j :ReflexEvent
+```
+
+When an interface transitions between `up` and `down` between two
+consecutive SNMP polls of a device, the adapter publishes
+`sensory.link_down.snmp_poll.<device>|<ifname>` (or `link_up`) to NATS.
+The reflex runner picks it up, runs the existing `link_down` handler
+(dedup + outcome construction), and persists the resulting outcome as
+a `:ReflexEvent` node in the graph with an `:AFFECTS` edge to the
+matched device.
+
+After this lands operators can query reflex history with:
+
+```cypher
+MATCH (e:ReflexEvent {handler: 'link_down'})
+RETURN e ORDER BY e.observed_at_ms DESC LIMIT 10
+```
+
+### Added
+- `netcortex.contracts.reflex_event_sink.ReflexEventSink` Protocol —
+  the narrow persistence surface every reflex outcome sink must satisfy
+  (idempotent `record`, `close`). Adding a NetBox-journal sink or an
+  OpenSearch sink later means writing one class against this Protocol.
+- `netcortex.episodic` package — new "episodic memory" layer in the
+  brain metaphor. Houses:
+  - `InMemoryReflexEventSink` — used by tests, deduplicates via stable
+    sha256 of `(handler, subject, target, occurred_at)`.
+  - `Neo4jReflexEventSink` — production default. Writes `:ReflexEvent`
+    nodes via the shared driver, with an optional `:AFFECTS` edge to
+    `:Device` when the target parses as `<device>|<interface>`. MERGE
+    on the stable id makes it at-least-once safe.
+- `netcortex.thalamus.SensoryPublisher` — thin facade over the
+  `EventBus` Protocol. Validates `source` against `SENSORY_SOURCES` at
+  construction (so wiring typos crash at import, not at 3am), builds
+  validated `sensory_subject()` per publish, injects `source` /
+  `recorded_at` defaults, swallows + logs bus failures so a transient
+  NATS hiccup doesn't kill the poll loop.
+- `netcortex.adapters.snmp_link_state_publisher.emit_link_state_transitions`
+  — focused module the SNMP adapter calls each poll. Reads prior
+  `oper_status` for the device's interfaces from Neo4j, diffs against
+  the fresh `if_map`, publishes one event per transition. Silently
+  no-ops on missing publisher / driver / empty map so the SNMP poller
+  doesn't need feature-flag branching. **First-ever poll** of a device
+  only emits for currently-`down` interfaces — prevents a 96-port
+  switch from publishing 96 `link_up` events on first observation.
+- `SnmpAdapter.attach_event_publisher(publisher)` — worker startup
+  calls this on every SNMP adapter instance after the bus is ready.
+- `ReflexContext.event_sink` field — when set, the runner persists
+  every returned outcome (logged / applied / skipped / errored) to
+  the sink. Handlers stay pure functions; persistence is the runner's
+  job.
+- Worker reflex pipeline startup (`_start_reflex_pipeline`):
+  constructs `NatsEventBus`, `SensoryPublisher(source='snmp_poll')`,
+  `Neo4jReflexEventSink`, and a `ReflexRunner` with full context.
+  Logs `worker.reflex_pipeline_started` on success. Graceful no-op
+  when `NATS_URL` is unset (degraded service, not a crash). Clean
+  drain of runner and bus on shutdown.
+- Tests:
+  - `tests/contracts/reflex_event_sink/` — Protocol-conformance suite,
+    runs against `InMemoryReflexEventSink` today, ready for the Neo4j
+    sink when CI gets a Neo4j service container.
+  - `tests/thalamus/test_sensory_publisher.py` — covers source
+    validation, default injection, bus-failure swallowing, and
+    caller-provided override of source/recorded_at.
+  - `tests/adapters/test_snmp_link_state_publisher.py` — fake-driver
+    tests for all 4 transition combinations plus first-observation,
+    Neo4j-read failure, unknown oper_status, no-publisher, no-driver,
+    empty-map cases.
+  - `tests/reflex/test_runner.py` extended: outcomes persist to a
+    configured `event_sink`; sink failures don't kill dispatch and
+    don't drop in-process `runner.outcomes`.
+
+### Changed
+- `ReflexRunner` now writes every recorded outcome to
+  `context.event_sink` (when set). Sink exceptions are logged and
+  swallowed — the runner stays online for the next event.
+- `ReflexRunner` module docstring updated: dev2/dev3 ("only logged")
+  language replaced with dev5 ("written to ReflexContext.event_sink").
+- `LinkDownHandler` module docstring updated: dev2/dev3 ("still idle")
+  language replaced with the dev5 pipeline description. Rationale text
+  on the `logged` outcome now says "persisted to episodic memory"
+  instead of "no remediation yet".
+
+### Why this matters
+- This is the **first** operational use of the NATS bus that has been
+  sitting idle since dev4. Until now, an operator looking at the
+  cluster could see `netcortex-nats-0` running but had no way to
+  verify the whole brain-shaped pipeline actually works.
+- Establishes the pattern for every future publisher (Meraki webhook,
+  SNMP trap, gNMI dial-out): build a `SensoryPublisher`, hand it to
+  the adapter, emit at observation time. Each new publisher is now a
+  ~50-line change, not an architectural one.
+- Validates the dedup design (dev3) for real: when the SNMP trap
+  receiver lands in dev6, the *same* logical link-down will arrive
+  from both `snmp_poll` and `snmp_trap` sources, and the
+  `DedupStore`-backed handler will correctly suppress the duplicate
+  within its 60s window.
+
+### Operational verification on `cpn-ful-netcortex1`
+After deploying:
+```cypher
+MATCH (e:ReflexEvent {handler: 'link_down'})
+WHERE e.recorded_at > timestamp() - 86400000
+RETURN e.subject, e.target, e.observed_at_ms, e.outcome
+ORDER BY e.observed_at_ms DESC LIMIT 20
+```
+Expect entries within minutes of any interface flap. Log lines to
+correlate: `snmp.link_state.transitions_published`,
+`bus.published subject=sensory.link_down.snmp_poll.*`,
+`reflex.outcome handler=link_down`.
+
+---
+
 ## [0.8.0-dev4] — Deployment-safety: NetBox writeback dry-run knob
 
 > Note: dev4 was originally planned for the first SensoryEvent publisher.

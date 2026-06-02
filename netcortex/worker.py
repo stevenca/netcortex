@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import signal
 import time
+from typing import Any
 
 import structlog
 
@@ -673,6 +674,59 @@ def _get_cfg_safe() -> dict | None:
         return None
 
 
+async def _start_reflex_pipeline(
+    cfg: Any,
+) -> tuple[Any | None, Any | None, Any | None]:
+    """Stand up the NATS bus + reflex runner + sensory publisher.
+
+    Returns ``(bus, runner, snmp_publisher)`` so the caller can:
+      * attach the publisher to the SNMP adapter
+      * call ``runner.stop()`` and ``bus.close()`` on shutdown
+
+    Any failure here logs and returns ``(None, None, None)`` so the
+    worker stays online (NATS not being available is degraded service,
+    not a crash condition — the rest of the cluster still reconciles
+    NetBox, polls SNMP, and serves the API).
+    """
+    nats_url = getattr(cfg, "nats_url", "") or _os_environ_nats_url()
+    if not nats_url:
+        log.info("worker.reflex_pipeline_disabled", reason="NATS_URL not set")
+        return None, None, None
+    try:
+        from netcortex.thalamus import NatsEventBus, SensoryPublisher
+        from netcortex.reflex.runner import ReflexRunner
+        from netcortex.reflex.protocol import ReflexContext
+        from netcortex.working.dedup import InMemoryDedupStore
+        from netcortex.episodic import Neo4jReflexEventSink
+        # Import handlers so they auto-register with the registry before
+        # the runner enumerates it. Side-effect import is intentional.
+        import netcortex.reflex.handlers  # noqa: F401
+
+        bus = NatsEventBus(nats_url)
+        snmp_publisher = SensoryPublisher(bus, source="snmp_poll")
+        context = ReflexContext(
+            dedup_store=InMemoryDedupStore(),
+            event_sink=Neo4jReflexEventSink(),
+        )
+        runner = ReflexRunner(bus, context=context)
+        await runner.start()
+        log.info(
+            "worker.reflex_pipeline_started",
+            nats_url=nats_url,
+            handlers=[h.id for h in runner.handlers],
+        )
+        return bus, runner, snmp_publisher
+    except Exception as exc:
+        log.error("worker.reflex_pipeline_failed", error=str(exc))
+        return None, None, None
+
+
+def _os_environ_nats_url() -> str:
+    """NATS_URL env-var fallback when Settings doesn't expose it."""
+    import os
+    return os.environ.get("NATS_URL", "")
+
+
 async def _main() -> None:
     import netcortex.config as cfg_module
     from netcortex.graph import client as neo4j_client
@@ -724,6 +778,18 @@ async def _main() -> None:
     if not instances:
         log.warning("worker.no_adapters",
                     hint="Configure adapter instances in your secret backend")
+
+    # Reflex pipeline (0.8.0-dev5) — NATS bus, runner, sensory publisher.
+    # No-op (returns None,None,None) when NATS_URL is not configured.
+    reflex_bus, reflex_runner, snmp_publisher = await _start_reflex_pipeline(cfg)
+    if snmp_publisher is not None:
+        attached = 0
+        for adapter in instances.values():
+            attach = getattr(adapter, "attach_event_publisher", None)
+            if callable(attach) and getattr(adapter, "name", "") == "snmp":
+                attach(snmp_publisher)
+                attached += 1
+        log.info("worker.reflex_publisher_attached", snmp_adapters=attached)
 
     # Build per-type intervals from config as the final fallback.
     # Resolution order (most specific wins):
@@ -786,6 +852,20 @@ async def _main() -> None:
         await _shutdown.wait()
     else:
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Tear down reflex pipeline cleanly so NATS subscriptions drain
+    # before the pod exits. Each step is best-effort; we don't want a
+    # shutdown bug to delay the SIGTERM grace period.
+    if reflex_runner is not None:
+        try:
+            await reflex_runner.stop()
+        except Exception as exc:
+            log.warning("worker.reflex_runner_stop_failed", error=str(exc))
+    if reflex_bus is not None:
+        try:
+            await reflex_bus.close()
+        except Exception as exc:
+            log.warning("worker.reflex_bus_close_failed", error=str(exc))
 
     await neo4j_client.close()
     log.info("worker.shutdown")
