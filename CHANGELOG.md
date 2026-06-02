@@ -24,6 +24,49 @@ and this file MUST be updated together whenever `__version__` changes.
 
 ---
 
+## [0.8.0-dev6] — Sanitize whitespace in NATS subject target parts
+
+Hot-fix to dev5, caught within seconds of the dev5 deploy on
+`cpn-ful-netcortex1`. Meraki MS switches expose interface names like
+`"Port 3"`, `"Port 4"` with literal spaces — NATS subjects forbid
+whitespace, so the publisher's validator (correctly) rejected every
+such event and the worker log filled with:
+
+```
+snmp.link_state.publish_failed device=cpn-arlington-ms1 interface=Port 3
+  error=sensory subject target part 0='cpn-arlington-ms1|Port 3'
+  contains whitespace; NATS subjects must be whitespace-free
+```
+
+The fix sanitizes whitespace at the `SensoryPublisher` boundary so every
+future publisher (Meraki webhook, SNMP trap, gNMI dial-out) inherits
+the behavior without each one re-implementing it.
+
+### Changed
+- `SensoryPublisher.publish` now collapses any whitespace run in each
+  target part to a single `_` before building the subject. The original
+  identifier is preserved verbatim in the payload's `interface` /
+  `device` / `target` fields, so consumers that need the human-readable
+  name still have it. Example: `Port 3` → subject token `Port_3`,
+  payload `interface: "Port 3"`.
+
+### Unchanged on purpose
+- Dots in target parts remain a hard error (they are the NATS token
+  separator; silently splitting would mask a programmer bug).
+- The `sensory_subject()` validator and all other Protocol-level
+  rejections are unchanged.
+
+### Tests
+- Added 3 cases to `tests/thalamus/test_sensory_publisher.py`:
+  whitespace sanitization, multi-whitespace-run collapse, dots-still-reject.
+
+### Operational note
+Once deployed, the previously-suppressed Meraki MS port events will
+start flowing through the bus on the next SNMP poll cycle and (if any
+are actually down) will produce `:ReflexEvent` nodes in Neo4j.
+
+---
+
 ## [0.8.0-dev5] — First sensory publisher: SNMP link-state → NATS → :ReflexEvent
 
 Closes the loop on the dev1–dev4 foundation. The bus has been live in
