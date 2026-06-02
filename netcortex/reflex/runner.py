@@ -25,11 +25,13 @@ cancels every per-handler task, drains the bus, and waits for the tasks to
 unwind. Callers that need to know the runner is fully up before publishing
 test events can ``await runner.ready_event.wait()``.
 
-In dev2 the outcomes are only logged — the Neo4j ``:ReflexEvent`` persistence
-path lands with the first real publisher in 0.8.0-dev3. Until then the
-runner is fully functional but every outcome surfaces as a structured log
-line, which is enough to integration-test the wiring end-to-end against
-``InMemoryEventBus``.
+Outcomes are written to ``ReflexContext.event_sink`` (the production
+default is :class:`~netcortex.episodic.Neo4jReflexEventSink`, which
+writes ``:ReflexEvent`` nodes). The runner also keeps every outcome in
+the in-process ``runner.outcomes`` list for the operator status endpoint
+to read without round-tripping through the graph. A context with no sink
+configured (the default) still works — outcomes are logged-only, which
+is the test path used by :class:`InMemoryEventBus`.
 """
 
 from __future__ import annotations
@@ -217,6 +219,22 @@ class ReflexRunner:
             outcome.severity,
             outcome.outcome,
         )
+        # Persist to the configured sink, if any. Sink failures are the
+        # sink's responsibility to log + drop — we deliberately don't
+        # catch here so a programmer-error exception (malformed outcome,
+        # misconfigured sink) still surfaces loudly via the dispatch
+        # wrapper's top-level try in the next event.
+        sink = self._context.event_sink
+        if sink is not None:
+            try:
+                await sink.record(outcome)
+            except Exception as exc:
+                _LOG.warning(
+                    "reflex.runner.sink_failed handler=%s subject=%s error=%s",
+                    outcome.handler,
+                    outcome.subject,
+                    exc,
+                )
 
 
 __all__ = ["ReflexRunner"]

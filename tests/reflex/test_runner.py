@@ -294,3 +294,70 @@ async def test_explicit_context_is_threaded_to_handler() -> None:
         await runner.stop()
         await store.close()
         await bus.close()
+
+
+async def test_runner_persists_outcomes_to_event_sink() -> None:
+    """Dev5: a context with an event_sink causes the runner to persist outcomes.
+
+    Confirms the dev5 wiring end-to-end on the in-memory bus + in-memory
+    sink: publish → handler → outcome → sink. The sink dedup invariant
+    (same handler/subject/target/occurred_at collapses) is in the
+    contract suite; this test is about the runner doing the call at all.
+    """
+    from netcortex.episodic import InMemoryReflexEventSink
+
+    bus = _bus()
+    handler = _RecordingHandler("link_down", "sensory.link_down.>")
+    sink = InMemoryReflexEventSink()
+    ctx = ReflexContext(event_sink=sink)
+    runner = ReflexRunner(bus, handlers=[handler], context=ctx)
+    await runner.start()
+    try:
+        await asyncio.sleep(0.05)
+        await bus.publish(
+            "sensory.link_down.snmp_poll.r1|Gi0/1",
+            {"interface": "Gi0/1", "target": "r1"},
+        )
+        await _wait_for(lambda: len(sink) == 1)
+    finally:
+        await runner.stop()
+        await sink.close()
+        await bus.close()
+
+    assert sink.outcomes[0].handler == "link_down"
+    assert sink.outcomes[0].subject == "sensory.link_down.snmp_poll.r1|Gi0/1"
+
+
+async def test_runner_sink_failure_does_not_break_dispatch() -> None:
+    """A flaky sink must not stop the runner from processing subsequent events.
+
+    Specifically asserts that handler outcomes still accumulate in
+    ``runner.outcomes`` even when sink.record() raises, so the operator
+    status endpoint stays accurate during a backend outage.
+    """
+
+    class _FlakeySink:
+        async def record(self, outcome: ReflexOutcome) -> None:
+            raise RuntimeError("simulated sink outage")
+
+        async def close(self) -> None:
+            return None
+
+    bus = _bus()
+    handler = _RecordingHandler("link_down", "sensory.link_down.>")
+    ctx = ReflexContext(event_sink=_FlakeySink())
+    runner = ReflexRunner(bus, handlers=[handler], context=ctx)
+    await runner.start()
+    try:
+        await asyncio.sleep(0.05)
+        await bus.publish("sensory.link_down.snmp_poll.r1|Gi0/1", {"i": 0})
+        await bus.publish("sensory.link_down.snmp_poll.r1|Gi0/2", {"i": 1})
+        await _wait_for(lambda: len(handler.seen) == 2)
+    finally:
+        await runner.stop()
+        await bus.close()
+
+    # Both events still dispatched and recorded in-process despite
+    # the sink failure on each one.
+    assert len(handler.seen) == 2
+    assert len(runner.outcomes) == 2

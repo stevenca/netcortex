@@ -3174,6 +3174,20 @@ class SnmpAdapter(PlatformAdapter):
         # ``(instance_name, network_id)``.  See _fetch_meraki_network_snmp_creds
         # and _resolve_device_creds for the consumption path.
         self._meraki_network_snmp_creds: dict[tuple[str, str], dict[str, str]] = {}
+        # Sensory event publisher (0.8.0-dev5). Optional — the adapter
+        # functions identically when None (the worker doesn't wire NATS).
+        # Set by the worker via :meth:`attach_event_publisher` after the
+        # bus and publisher are constructed at startup.
+        self._event_publisher: Any | None = None
+
+    def attach_event_publisher(self, publisher: Any) -> None:
+        """Wire a :class:`SensoryPublisher` for emitting state-change events.
+
+        Called once at worker startup, after the NATS bus and publisher
+        are constructed. ``publisher`` should have ``source='snmp_poll'``.
+        Passing ``None`` is a no-op for symmetry with shutdown.
+        """
+        self._event_publisher = publisher
 
     async def authenticate(self) -> None:
         """No separate auth step — credentials resolved per-device at poll time."""
@@ -4214,6 +4228,33 @@ class SnmpAdapter(PlatformAdapter):
                 combined = combined.merge(health_node)
         except Exception as exc:
             log.debug("snmp.interface_emit.failed", host=ip, error=str(exc))
+
+        # ── Sensory publish (0.8.0-dev5) ────────────────────────────────
+        # Detect ifOperStatus transitions vs prior Neo4j state and emit
+        # `sensory.link_down|link_up.snmp_poll.<device>|<ifname>` events
+        # to NATS so reflex handlers (e.g. link_down) can react.
+        # Silently no-ops when the publisher is not wired (worker without
+        # NATS) or the graph driver isn't initialized yet.
+        if self._event_publisher is not None and if_map:
+            try:
+                from netcortex.adapters.snmp_link_state_publisher import (
+                    emit_link_state_transitions,
+                )
+                from netcortex.graph.client import get_driver as _get_driver
+                try:
+                    driver = _get_driver()
+                except Exception:
+                    driver = None
+                await emit_link_state_transitions(
+                    publisher=self._event_publisher,
+                    driver=driver,
+                    device_node_id=dev_node_id,
+                    device_name=dev_name,
+                    if_map=if_map,
+                )
+            except Exception as exc:
+                # Never let publishing break a poll cycle.
+                log.debug("snmp.link_state.emit_failed", host=ip, error=str(exc))
 
         # ── MIB coverage probe ───────────────────────────────────────────
         # Cheap (~12 single-OID walks with 2 repetitions each, bounded

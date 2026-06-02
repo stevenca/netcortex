@@ -19,7 +19,13 @@ from typing import Any
 
 import pytest
 
-from netcortex.contracts import DedupStore, EventBus, Policy, SensoryAdapter
+from netcortex.contracts import (
+    DedupStore,
+    EventBus,
+    Policy,
+    ReflexEventSink,
+    SensoryAdapter,
+)
 
 # ---------------------------------------------------------------------------
 # EventBus registry.
@@ -148,13 +154,47 @@ def dedup_store_factory(request: pytest.FixtureRequest) -> Callable[[], DedupSto
     raise RuntimeError(f"unknown dedup store impl: {name}")
 
 
+# ---------------------------------------------------------------------------
+# ReflexEventSink registry.
+# ---------------------------------------------------------------------------
+
+
+def _make_in_memory_reflex_event_sink() -> ReflexEventSink:
+    from netcortex.episodic import InMemoryReflexEventSink
+
+    return InMemoryReflexEventSink()
+
+
+# Neo4j-backed sink requires a live cluster; same skip-on-absence pattern as
+# _make_nats_event_bus above can be added when we wire a NEO4J_URI service
+# container into the contracts CI job.
+REFLEX_EVENT_SINK_IMPLEMENTATIONS: list[tuple[str, Callable[[], ReflexEventSink]]] = [
+    ("in_memory", _make_in_memory_reflex_event_sink),
+]
+
+
+@pytest.fixture(
+    params=[name for name, _ in REFLEX_EVENT_SINK_IMPLEMENTATIONS], ids=lambda n: n
+)
+def reflex_event_sink_factory(
+    request: pytest.FixtureRequest,
+) -> Callable[[], ReflexEventSink]:
+    name: str = request.param
+    for n, factory in REFLEX_EVENT_SINK_IMPLEMENTATIONS:
+        if n == name:
+            return factory
+    raise RuntimeError(f"unknown reflex event sink impl: {name}")
+
+
 __all__: Iterable[str] = (
     "DEDUP_STORE_IMPLEMENTATIONS",
     "EVENT_BUS_IMPLEMENTATIONS",
+    "REFLEX_EVENT_SINK_IMPLEMENTATIONS",
     "SENSORY_ADAPTER_IMPLEMENTATIONS",
     "POLICY_IMPLEMENTATIONS",
     "dedup_store_factory",
     "event_bus_factory",
+    "reflex_event_sink_factory",
     "sensory_adapter_factory",
     "policy_factory",
 )
