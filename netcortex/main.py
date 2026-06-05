@@ -278,6 +278,21 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     state.redis_status  = redis_status
     state.redis_message = redis_msg
 
+    # ── NATS sensory publisher bus (0.8.0-dev8+) ──────────────────────────
+    # The web process publishes `sensory.*` events when webhooks arrive;
+    # the worker process owns the runner that consumes them. Bus init is
+    # best-effort: a missing NATS_URL or a transient NATS outage degrades
+    # webhooks back to their pre-dev8 sync-trigger behavior, which still
+    # reconciles the live-state graph.
+    nats_url = (
+        getattr(cfg, "nats_url", "") if cfg else ""
+    ) or os.environ.get("NATS_URL", "")
+    try:
+        from netcortex.webhooks.event_publisher import init_event_bus
+        await init_event_bus(app, nats_url=nats_url or None)
+    except Exception as exc:
+        log.warning("netcortex.sensory_publisher_init_failed", error=str(exc))
+
     # ── Load and health-check adapters ───────────────────────────────────
     if cfg:
         await _probe_adapters()
@@ -332,6 +347,11 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
     # ── Shutdown ──────────────────────────────────────────────────────────
     refresh_adapter_task.cancel()
     refresh_graph_task.cancel()
+    try:
+        from netcortex.webhooks.event_publisher import close_event_bus
+        await close_event_bus(app)
+    except Exception as exc:
+        log.warning("netcortex.sensory_publisher_close_failed", error=str(exc))
     await neo4j_client.close()
     log.info("netcortex.shutdown")
 

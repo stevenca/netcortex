@@ -24,6 +24,109 @@ and this file MUST be updated together whenever `__version__` changes.
 
 ---
 
+## [0.8.0-dev8] — Second sensory publisher: Meraki webhook → NATS
+
+First webhook-side sensory publisher. The web process now publishes
+`sensory.*` events when Meraki Dashboard webhooks arrive, so a port
+flap detected at the network edge reaches the reflex pipeline in
+50–200ms instead of waiting up to a full SNMP poll cycle (5 minutes).
+
+This is also the first release where the dedup store added in
+0.8.0-dev3 actually does anything in production: the same port flap
+will now be observed by both the Meraki webhook (immediate) and the
+SNMP poller (next cycle), and the second arrival within the 60s dedup
+window collapses to a single `:ReflexEvent`.
+
+### Added
+- `netcortex/webhooks/event_publisher.py` — web-process bus
+  coordination. One `NatsEventBus` per process on `app.state.event_bus`;
+  one cached `SensoryPublisher` per source token on
+  `app.state._sensory_publishers`. Graceful degradation when
+  `NATS_URL` is unset (publishing disabled, sync trigger still fires).
+- `netcortex/webhooks/meraki_events.py` — pure mapper from Meraki's
+  vendor dialect (`alertType` + `alertData`) to our closed
+  `SENSORY_EVENT_CLASSES` vocabulary. Initial coverage:
+  - `Port connectivity` / `Switch port connection changed` → `link_up` / `link_down`
+  - `Uplink status change` → `link_up` / `link_down`
+  - `IDS alerted` / `Malware detected` → `security_alert`
+  - `Settings changed` / `Configuration change` → `config_change`
+  - Unknown alertTypes log `webhook.meraki.unmapped_alert_type` and skip
+    (so we grow coverage based on real traffic, not speculation)
+- Target shape: `meraki:<deviceSerial>|<portName>` for port events,
+  `meraki:<deviceSerial>|<clientMac>` for IDS, etc. Uses the same
+  `meraki:` prefix as `Device.id` in the live graph so the dev7
+  `:AFFECTS` edge resolver lands the edge automatically.
+
+### Changed
+- `netcortex/webhooks/meraki.py::handle_meraki_webhook` accepts an
+  optional `publisher: SensoryPublisher | None` parameter. When
+  provided, the handler runs the mapper and publishes one event per
+  mapped alert. Pre-dev8 sync-trigger behavior is unchanged when
+  the publisher is absent.
+- `netcortex/webhooks/router.py` resolves the publisher via
+  `get_publisher(request.app, "meraki_webhook")` and threads it
+  through to the handler.
+- `netcortex/main.py` lifespan now initializes the NATS bus on
+  startup (`init_event_bus`) and closes it on shutdown
+  (`close_event_bus`). Both steps are best-effort — a missing
+  `NATS_URL` or transient outage degrades webhooks back to their
+  pre-dev8 sync-only behavior, never blocks startup.
+- Webhook response body adds `sensory_events_published: <count>` so
+  operators can confirm at-a-glance which webhooks made it through
+  the publish path.
+
+### Tests
+- `tests/webhooks/test_meraki_events.py` — 18 mapper unit tests
+  covering every supported alertType, both up and down states,
+  synonym handling, missing-field degradation, and a subject-builder
+  compatibility smoke test.
+- `tests/webhooks/test_meraki_webhook_route.py` — 10 HTTP integration
+  tests covering HMAC valid/invalid/missing, signature prefix
+  compatibility, malformed JSON, no-secret-configured degradation,
+  unknown alertType, IDS publish, publisher-unavailable path, and
+  bus-failure-during-publish path.
+- This is the first FastAPI `TestClient` test module in the repo;
+  pattern (capturing bus + minimal app + secret fixture) is
+  generalized via `conftest.py` so dev9/dev10/dev11 vendor
+  receivers can reuse it.
+
+### Operational notes
+- The web deployment in `deploy/helm` already sets `NATS_URL` when
+  `nats.enabled` is true — no Helm change required.
+- HMAC secrets continue to live at
+  `netcortex/webhooks/meraki/<instance_name>` in AWS Secrets
+  Manager (pre-existing storage path).
+- A new Cypher query to find webhook-sourced events:
+  ```cypher
+  MATCH (e:ReflexEvent {source: 'meraki_webhook'})
+  WHERE e.recorded_at > timestamp() - 3600000
+  RETURN e.subject, e.target, e.outcome
+  ORDER BY e.observed_at_ms DESC
+  ```
+- To see dedup in action (webhook + SNMP poll observing the same
+  flap), join on target within a tight window:
+  ```cypher
+  MATCH (e1:ReflexEvent), (e2:ReflexEvent)
+  WHERE e1.target = e2.target
+    AND e1.source = 'meraki_webhook'
+    AND e2.source = 'snmp_poll'
+    AND e1.event_class = e2.event_class
+    AND abs(e1.observed_at_ms - e2.observed_at_ms) < 60000
+  RETURN e1.target, e1.outcome AS webhook_outcome, e2.outcome AS snmp_outcome
+  ```
+  In a well-dedupping system the SNMP-side outcome will be `skipped`
+  for any flap the webhook caught first.
+
+### Not in this release (deferred)
+- `:ThousandEyes` / `:NexusDashboard` / `:cdFMC` webhook receivers
+  (dev9, dev10, dev11).
+- `nexus_dashboard_webhook` and `fmc_webhook` source tokens (added
+  alongside their respective receivers).
+- JetStream durable subscriptions for guaranteed at-least-once across
+  worker restarts.
+
+---
+
 ## [0.8.0-dev7] — :AFFECTS edge resolution + target/subject consistency
 
 Second small polish to the dev5 pipeline, surfaced by deployment
