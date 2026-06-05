@@ -24,6 +24,7 @@ from fastapi.responses import StreamingResponse
 
 from netcortex.webhooks.meraki import handle_meraki_webhook
 from netcortex.webhooks.catalyst_center import handle_catalyst_center_webhook
+from netcortex.webhooks.event_publisher import get_publisher
 from netcortex.webhooks.telemetry import handle_telemetry_push, telemetry_event_stream
 
 log = structlog.get_logger(__name__)
@@ -62,11 +63,16 @@ async def meraki_webhook(
         bytes=len(body),
         has_sig=x_cisco_meraki_signature is not None,
     )
+    # Lazily fetch the per-app SensoryPublisher for the meraki_webhook
+    # source. Returns None when NATS_URL isn't configured — handler
+    # degrades to its pre-dev8 sync-only behavior in that case.
+    publisher = get_publisher(request.app, "meraki_webhook")
     result = await handle_meraki_webhook(
         instance_name=instance_name,
         body=body,
         signature_header=x_cisco_meraki_signature,
         background_tasks=background_tasks,
+        publisher=publisher,
     )
     return result
 

@@ -14,10 +14,13 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from fastapi import BackgroundTasks, HTTPException, status
+
+if TYPE_CHECKING:
+    from netcortex.thalamus import SensoryPublisher
 
 log = structlog.get_logger(__name__)
 
@@ -62,8 +65,26 @@ async def handle_meraki_webhook(
     body: bytes,
     signature_header: str | None,
     background_tasks: BackgroundTasks,
+    publisher: "SensoryPublisher | None" = None,
 ) -> dict[str, str]:
-    """Validate and enqueue a Meraki webhook event."""
+    """Validate and process a Meraki webhook event.
+
+    Two side effects, both best-effort and independent:
+
+    1. **Publish sensory events to NATS** (0.8.0-dev8 and later) so
+       reflex handlers and the episodic memory layer see the event in
+       seconds, not minutes. Driven by the
+       :mod:`netcortex.webhooks.meraki_events` mapper.
+    2. **Trigger a targeted adapter sync** (pre-dev8 behavior) so the
+       Neo4j live-state graph reflects the change. This stays even
+       when the sensory side is wired in: graph sync re-derives
+       authoritative state, sensory events feed the reflex layer.
+
+    The two paths are intentionally decoupled: a NATS hiccup must not
+    block the sync, and a misbehaving adapter must not block the
+    publish. Both run inside the request handler (publish is async +
+    fast; sync is in BackgroundTasks).
+    """
     shared_secret = await _get_shared_secret(instance_name)
 
     if shared_secret is not None:
@@ -101,7 +122,32 @@ async def handle_meraki_webhook(
         org_id=org_id,
     )
 
-    # Targeted refresh: only re-sync the affected network if possible.
+    # ── Publish sensory events ────────────────────────────────────────────
+    # Pure mapper from vendor dialect to our subjects taxonomy. The
+    # publisher itself is best-effort; per-event publish failures are
+    # logged inside :class:`SensoryPublisher` and don't propagate.
+    sensory_published = 0
+    if publisher is not None:
+        try:
+            from netcortex.webhooks.meraki_events import map_meraki_payload
+            events = map_meraki_payload(payload)
+            for ev in events:
+                await publisher.publish(
+                    ev.event_class, *ev.target_parts, payload=ev.payload
+                )
+            sensory_published = len(events)
+        except Exception as exc:
+            # Mapper bugs or malformed payloads should not 5xx the
+            # webhook — they should log and let the sync trigger fire
+            # so live state still reconciles.
+            log.warning(
+                "webhook.meraki.publish_failed",
+                instance=instance_name,
+                event_type=event_type,
+                error=str(exc),
+            )
+
+    # ── Targeted adapter sync (pre-dev8 behavior, retained) ───────────────
     background_tasks.add_task(
         _sync_meraki_network,
         instance_name=instance_name,
@@ -114,6 +160,7 @@ async def handle_meraki_webhook(
         "status": "queued",
         "adapter": f"meraki/{instance_name}",
         "event_type": event_type,
+        "sensory_events_published": str(sensory_published),
     }
 
 
