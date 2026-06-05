@@ -28,20 +28,49 @@ _SECRET_CACHE: dict[str, str] = {}  # instance_name → shared_secret
 
 
 async def _get_shared_secret(instance_name: str) -> str | None:
-    """Fetch the Meraki webhook shared secret from the secret backend."""
+    """Fetch the Meraki webhook shared secret from the secret backend.
+
+    Returns ``None`` when the secret is not configured for this tenant.
+    Note: returning ``None`` causes the route to accept the webhook
+    with a loud warning (see :func:`handle_meraki_webhook`). That is
+    intentional for bootstrapping (operators can validate the receive
+    path before plumbing secrets), **but** it means a misconfigured
+    backend silently disables HMAC verification — so this function
+    distinguishes "secret not configured" (return None) from "backend
+    unreachable / wrong API" (log loudly + return None — same outcome
+    so we don't crash the request, but operators can spot the
+    mismatch in logs).
+
+    Historical note: prior to 0.8.0-dev9 this function called
+    ``backend.get_secret(...)`` which is not a real method on
+    :class:`AwsSecretsManagerBackend` — the bare ``except Exception``
+    swallowed the resulting ``AttributeError`` and HMAC verification
+    silently fell open for every tenant. Fixed in dev9 to use the
+    correct ``backend.get(path, required=False)`` API.
+    """
     if instance_name in _SECRET_CACHE:
         return _SECRET_CACHE[instance_name]
+    path = f"netcortex/webhooks/meraki/{instance_name}"
     try:
         from netcortex.secrets import get_secret_backend
         backend = get_secret_backend()
-        data = await backend.get_secret(f"netcortex/webhooks/meraki/{instance_name}")
-        secret = data.get("shared_secret")
-        if secret:
-            _SECRET_CACHE[instance_name] = secret
-        return secret
+        data = await backend.get(path, required=False)
     except Exception as exc:
-        log.warning("webhook.meraki.secret_fetch_failed", instance=instance_name, error=str(exc))
+        log.warning(
+            "webhook.meraki.secret_fetch_failed",
+            instance=instance_name,
+            path=path,
+            error=str(exc),
+        )
         return None
+    if not data:
+        # No secret stored for this tenant. Distinct from a backend
+        # error — the path is well-formed, the secret just isn't set.
+        return None
+    secret = data.get("shared_secret")
+    if secret:
+        _SECRET_CACHE[instance_name] = secret
+    return secret
 
 
 def _verify_signature(body: bytes, signature_header: str | None, shared_secret: str) -> bool:

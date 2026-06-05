@@ -24,19 +24,33 @@ _SECRET_CACHE: dict[str, str] = {}
 
 
 async def _get_shared_secret(instance_name: str) -> str | None:
+    """Fetch the Catalyst Center webhook shared token from the backend.
+
+    See ``netcortex/webhooks/meraki.py::_get_shared_secret`` for the
+    full story on the pre-0.8.0-dev9 ``AttributeError``-silently-
+    swallowed-by-bare-except bug that this function shared.
+    """
     if instance_name in _SECRET_CACHE:
         return _SECRET_CACHE[instance_name]
+    path = f"netcortex/webhooks/catalyst_center/{instance_name}"
     try:
         from netcortex.secrets import get_secret_backend
         backend = get_secret_backend()
-        data = await backend.get_secret(f"netcortex/webhooks/catalyst_center/{instance_name}")
-        secret = data.get("shared_secret")
-        if secret:
-            _SECRET_CACHE[instance_name] = secret
-        return secret
+        data = await backend.get(path, required=False)
     except Exception as exc:
-        log.warning("webhook.catc.secret_fetch_failed", instance=instance_name, error=str(exc))
+        log.warning(
+            "webhook.catc.secret_fetch_failed",
+            instance=instance_name,
+            path=path,
+            error=str(exc),
+        )
         return None
+    if not data:
+        return None
+    secret = data.get("shared_secret")
+    if secret:
+        _SECRET_CACHE[instance_name] = secret
+    return secret
 
 
 async def handle_catalyst_center_webhook(

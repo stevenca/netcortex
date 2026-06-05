@@ -24,6 +24,66 @@ and this file MUST be updated together whenever `__version__` changes.
 
 ---
 
+## [0.8.0-dev9] — Fix webhook HMAC verify silently failing open (security)
+
+**Pre-existing bug caught by the dev8 deploy.** While verifying the
+new Meraki webhook publisher end-to-end on `cpn-ful-netcortex1`, an
+adapter introspection revealed that both
+`webhooks/meraki.py::_get_shared_secret` and
+`webhooks/catalyst_center.py::_get_shared_secret` called
+`backend.get_secret(...)` — which is **not** a real method on
+`AwsSecretsManagerBackend` (the actual method is
+`backend.get(path, required=True)`).
+
+The bare `except Exception` swallowed the resulting `AttributeError`,
+`_SECRET_CACHE` stayed empty, and both webhook handlers fell through
+to their "no-secret-configured" branch — which **accepts the webhook
+without HMAC verification**, with only a warning log.
+
+In other words: every Meraki and Catalyst Center webhook received
+since these modules shipped has bypassed signature verification.
+With dev8 publishing `:ReflexEvent` nodes from those webhooks, any
+unauthenticated POST to `/webhooks/meraki/<tenant>` or
+`/webhooks/catalyst_center/<tenant>` could now produce graph
+artifacts. Fixing immediately.
+
+### Changed
+- `webhooks/meraki.py::_get_shared_secret`: now calls
+  `await backend.get(path, required=False)` (the correct API) and
+  distinguishes "no secret stored for this tenant" (return None)
+  from "backend error" (log loudly + return None). Cache still
+  populates on success.
+- `webhooks/catalyst_center.py::_get_shared_secret`: same fix.
+
+### Tests
+- New `tests/webhooks/test_secret_backend_integration.py` with 6
+  cases asserting that both webhook modules use the correct
+  `backend.get(path, required=False)` call, handle missing tenants
+  cleanly, swallow backend errors, and cache the result.
+- These tests would have caught the original bug. The pre-existing
+  route tests bypass `_get_shared_secret` entirely (they write to
+  `_SECRET_CACHE` directly via fixture), which is exactly how the
+  bug hid for so long. Lesson learned in `conftest.py`'s long
+  docstring for future webhook receivers (dev10/11/12).
+
+### Operational notes
+- Existing operators who relied on the bypass behavior to test
+  webhook ingestion without secrets configured will see 401s after
+  this deploys. The "no secret configured" warning path still works
+  if `_SECRET_CACHE` is empty AND the backend returns nothing for
+  the tenant — that's distinct from the actual bug, which was
+  AttributeError-from-wrong-API-method.
+- Verify after deploy:
+  - Send an unsigned POST to `/webhooks/meraki/<configured_tenant>`
+    → expect 401 (was 200 before this fix)
+  - Send a correctly-signed POST → expect 200 and a published event
+- Search logs for `webhook.meraki.secret_fetch_failed` — should be
+  zero (was previously firing on every webhook for tenants whose
+  secret was actually present in AWS SM, masked as
+  AttributeError).
+
+---
+
 ## [0.8.0-dev8] — Second sensory publisher: Meraki webhook → NATS
 
 First webhook-side sensory publisher. The web process now publishes
