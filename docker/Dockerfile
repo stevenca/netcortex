@@ -12,8 +12,18 @@ FROM base AS builder
 
 ARG EXTRAS="all"
 
+# gcc/libssl for native wheels; libxmlsec1/libxml2 + pkg-config so the
+# `xmlsec` wheel (pulled in by python3-saml, the in-app SAML SP) builds
+# and links against the system crypto libraries.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends gcc libssl-dev || true \
+    && apt-get install -y --no-install-recommends \
+        gcc \
+        pkg-config \
+        libssl-dev \
+        libxml2-dev \
+        libxmlsec1-dev \
+        libxmlsec1-openssl \
+    || true \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml README.md ./
@@ -24,11 +34,15 @@ RUN pip install --upgrade pip && pip install ".[${EXTRAS}]"
 # --- Runtime stage ---
 FROM base AS runtime
 
+# Runtime shared libs for xmlsec/lxml (SAML signature verification).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         curl \
         openssh-client \
         snmp \
+        libxml2 \
+        libxmlsec1 \
+        libxmlsec1-openssl \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user with a fixed numeric UID so Kubernetes can verify runAsNonRoot.

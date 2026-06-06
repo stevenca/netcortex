@@ -147,6 +147,41 @@ class Settings:
     telemetry_secret: str
     cors_allow_origins: list[str]
 
+    # SAML SSO + session management (0.8.0-dev11)
+    #
+    # When saml_enabled is true the web app runs an in-app SAML 2.0
+    # Service Provider: human browser access to the UI/API is gated behind
+    # an IdP login (Okta), while machine callers keep using the api_secret
+    # bearer and webhook HMAC/token auth. Sessions are stored server-side
+    # in Redis (opaque CSPRNG id in a Secure/HttpOnly cookie) — no PII or
+    # privileges live in the cookie.
+    saml_enabled: bool
+    # SP (this app) identity. saml_sp_base_url is the externally-reachable
+    # https origin; ACS/SLS/metadata URLs are derived from it unless set.
+    saml_sp_base_url: str
+    saml_sp_entity_id: str
+    # IdP (Okta) metadata — copy from the Okta app's "View SAML setup
+    # instructions" / metadata. The x509 cert verifies signed assertions.
+    saml_idp_entity_id: str
+    saml_idp_sso_url: str
+    saml_idp_slo_url: str
+    saml_idp_x509_cert: str
+    # Optional SP signing keypair (sign AuthnRequests / SLO). Secrets —
+    # store in the backend, never env.
+    saml_sp_x509_cert: str
+    saml_sp_private_key: str
+    # Optional coarse authorization: restrict who may establish a session.
+    # Empty lists = any successfully-authenticated IdP user is allowed.
+    saml_allowed_email_domains: list[str]
+    saml_allowed_groups: list[str]
+    saml_attr_groups: str  # SAML attribute name carrying group membership
+
+    # Session cookie / lifetime policy.
+    session_cookie_name: str
+    session_cookie_secure: bool
+    session_idle_timeout_seconds: int
+    session_absolute_timeout_seconds: int
+
     # Sync engine
     sync_backend: str
     sync_conflict_policy: str
@@ -232,6 +267,33 @@ class Settings:
         )
         self.telemetry_secret = os.environ.get("NETCORTEX_TELEMETRY_SECRET", "")
         self.cors_allow_origins = _env_csv("NETCORTEX_CORS_ALLOW_ORIGINS")
+
+        # SAML SSO + sessions (0.8.0-dev11). Bootstrap from env; the core
+        # secret (which holds the IdP cert and SP key) overrides in hydrate().
+        self.saml_enabled = _env_bool("NETCORTEX_SAML_ENABLED", default=False)
+        self.saml_sp_base_url = os.environ.get("NETCORTEX_SAML_SP_BASE_URL", "")
+        self.saml_sp_entity_id = os.environ.get("NETCORTEX_SAML_SP_ENTITY_ID", "")
+        self.saml_idp_entity_id = os.environ.get("NETCORTEX_SAML_IDP_ENTITY_ID", "")
+        self.saml_idp_sso_url = os.environ.get("NETCORTEX_SAML_IDP_SSO_URL", "")
+        self.saml_idp_slo_url = os.environ.get("NETCORTEX_SAML_IDP_SLO_URL", "")
+        self.saml_idp_x509_cert = ""
+        self.saml_sp_x509_cert = ""
+        self.saml_sp_private_key = ""
+        self.saml_allowed_email_domains = _env_csv("NETCORTEX_SAML_ALLOWED_EMAIL_DOMAINS")
+        self.saml_allowed_groups = _env_csv("NETCORTEX_SAML_ALLOWED_GROUPS")
+        self.saml_attr_groups = os.environ.get("NETCORTEX_SAML_ATTR_GROUPS", "groups")
+        self.session_cookie_name = os.environ.get(
+            "NETCORTEX_SESSION_COOKIE_NAME", "nc_session"
+        )
+        self.session_cookie_secure = _env_bool(
+            "NETCORTEX_SESSION_COOKIE_SECURE", default=True
+        )
+        self.session_idle_timeout_seconds = _env_int(
+            "NETCORTEX_SESSION_IDLE_TIMEOUT_SECONDS", default=1800  # 30 min
+        )
+        self.session_absolute_timeout_seconds = _env_int(
+            "NETCORTEX_SESSION_ABSOLUTE_TIMEOUT_SECONDS", default=28800  # 8 h
+        )
         # Secure-by-default. Override with NETBOX_VERIFY_SSL=0 or
         # core-secret `netbox_verify_ssl=false` for self-signed labs.
         _verify_env = os.environ.get("NETBOX_VERIFY_SSL")
@@ -348,6 +410,72 @@ class Settings:
                 ]
             elif isinstance(raw_cors, (list, tuple)):
                 self.cors_allow_origins = [str(o).strip() for o in raw_cors if str(o).strip()]
+        # ── SAML SSO + sessions (0.8.0-dev11) ─────────────────────────────
+        raw_saml_enabled = core.get("saml_enabled", self.saml_enabled)
+        if isinstance(raw_saml_enabled, str):
+            self.saml_enabled = raw_saml_enabled.strip().lower() in {
+                "1", "true", "yes", "on",
+            }
+        else:
+            self.saml_enabled = bool(raw_saml_enabled)
+        self.saml_sp_base_url = core.get("saml_sp_base_url", self.saml_sp_base_url)
+        self.saml_sp_entity_id = core.get("saml_sp_entity_id", self.saml_sp_entity_id)
+        self.saml_idp_entity_id = core.get("saml_idp_entity_id", self.saml_idp_entity_id)
+        self.saml_idp_sso_url = core.get("saml_idp_sso_url", self.saml_idp_sso_url)
+        self.saml_idp_slo_url = core.get("saml_idp_slo_url", self.saml_idp_slo_url)
+        self.saml_idp_x509_cert = core.get("saml_idp_x509_cert", self.saml_idp_x509_cert)
+        self.saml_sp_x509_cert = core.get("saml_sp_x509_cert", self.saml_sp_x509_cert)
+        self.saml_sp_private_key = core.get("saml_sp_private_key", self.saml_sp_private_key)
+
+        def _csv_or_list(value: Any, current: list[str]) -> list[str]:
+            if value is None:
+                return current
+            if isinstance(value, str):
+                return [v.strip() for v in value.split(",") if v.strip()]
+            if isinstance(value, (list, tuple)):
+                return [str(v).strip() for v in value if str(v).strip()]
+            return current
+
+        self.saml_allowed_email_domains = _csv_or_list(
+            core.get("saml_allowed_email_domains"), self.saml_allowed_email_domains
+        )
+        self.saml_allowed_groups = _csv_or_list(
+            core.get("saml_allowed_groups"), self.saml_allowed_groups
+        )
+        self.saml_attr_groups = core.get("saml_attr_groups", self.saml_attr_groups)
+        self.session_cookie_name = core.get("session_cookie_name", self.session_cookie_name)
+        raw_cookie_secure = core.get("session_cookie_secure", self.session_cookie_secure)
+        if isinstance(raw_cookie_secure, str):
+            self.session_cookie_secure = raw_cookie_secure.strip().lower() in {
+                "1", "true", "yes", "on",
+            }
+        else:
+            self.session_cookie_secure = bool(raw_cookie_secure)
+        self.session_idle_timeout_seconds = int(
+            core.get("session_idle_timeout_seconds", self.session_idle_timeout_seconds)
+        )
+        self.session_absolute_timeout_seconds = int(
+            core.get("session_absolute_timeout_seconds", self.session_absolute_timeout_seconds)
+        )
+
+        # Fail loudly if SAML is enabled but its required IdP fields are
+        # missing — otherwise every UI login would 500 at the IdP redirect.
+        if self.saml_enabled:
+            missing = [
+                k for k, v in {
+                    "saml_sp_base_url": self.saml_sp_base_url,
+                    "saml_idp_entity_id": self.saml_idp_entity_id,
+                    "saml_idp_sso_url": self.saml_idp_sso_url,
+                    "saml_idp_x509_cert": self.saml_idp_x509_cert,
+                }.items() if not v
+            ]
+            if missing:
+                log.error(
+                    "settings.saml_enabled_but_incomplete",
+                    missing=missing,
+                    hint="Provide these in netcortex/core or disable saml_enabled.",
+                )
+
         # Loud warning if the operator left fail-open enabled — this should
         # never be true in a production deployment.
         if self.webhook_allow_unsigned:

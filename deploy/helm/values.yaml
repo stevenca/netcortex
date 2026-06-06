@@ -238,6 +238,21 @@ ingress:
     - /ingest
     - /health
 
+  # IP allow-lists (0.8.0-dev11). nginx whitelist-source-range, applied
+  # per-ingress so the human UI and the machine receivers can have
+  # different allowed sources.
+  #
+  # adminAllowSourceRanges: CIDRs permitted to reach the UI/API/MCP admin
+  #   ingress (only created when exposeApi=true). Empty = no IP filter
+  #   (rely on SAML SSO + api_secret). Set to your office/VPN egress.
+  # webhookAllowSourceRanges: CIDRs permitted to reach /webhooks + /ingest.
+  #   Empty = open (vendor clouds use dynamic IPs; HMAC/token is the
+  #   control). Populate with vendor egress ranges to lock down later.
+  adminAllowSourceRanges: []
+    # - "203.0.113.0/24"     # office
+    # - "198.51.100.7/32"    # admin VPN
+  webhookAllowSourceRanges: []
+
   # Hard cap on request body size at the ingress (F3). Mirror the in-app
   # webhook_max_body_bytes (default 1 MiB).
   proxyBodySize: "1m"
