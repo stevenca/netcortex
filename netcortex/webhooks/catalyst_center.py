@@ -18,6 +18,8 @@ from typing import Any
 import structlog
 from fastapi import BackgroundTasks, HTTPException, status
 
+from netcortex.webhooks.auth import reject_if_unsigned, verify_shared_token
+
 log = structlog.get_logger(__name__)
 
 _SECRET_CACHE: dict[str, str] = {}
@@ -64,7 +66,9 @@ async def handle_catalyst_center_webhook(
     shared_secret = await _get_shared_secret(instance_name)
 
     if shared_secret is not None:
-        if auth_token != shared_secret:
+        # Constant-time comparison (0.8.0-dev10, F5): the previous `!=`
+        # leaked the token length/prefix through a timing side channel.
+        if not verify_shared_token(auth_token, shared_secret):
             log.warning(
                 "webhook.catc.invalid_token",
                 instance=instance_name,
@@ -75,11 +79,8 @@ async def handle_catalyst_center_webhook(
                 detail="Invalid Catalyst Center webhook token",
             )
     else:
-        log.warning(
-            "webhook.catc.no_secret_configured",
-            instance=instance_name,
-            hint="Store shared_secret at netcortex/webhooks/catalyst_center/<instance_name>",
-        )
+        # Fail closed (0.8.0-dev10, F1): reject when no token is configured.
+        reject_if_unsigned(kind="catalyst_center", instance_name=instance_name)
 
     try:
         payload: dict[str, Any] = json.loads(body)
@@ -106,13 +107,17 @@ async def handle_catalyst_center_webhook(
         device=device,
     )
 
-    background_tasks.add_task(
-        _sync_catalyst_center,
-        instance_name=instance_name,
-        event_type=event_type,
-        domain=domain,
-        device=device,
-        payload=payload,
+    # Coalesced sync (0.8.0-dev10, F4) — single-flight, rate-limited.
+    from netcortex.webhooks.sync_coalesce import schedule_sync
+    schedule_sync(
+        f"catalyst_center/{instance_name}",
+        lambda: _sync_catalyst_center(
+            instance_name=instance_name,
+            event_type=event_type,
+            domain=domain,
+            device=device,
+            payload=payload,
+        ),
     )
 
     return {

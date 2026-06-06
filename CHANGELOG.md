@@ -24,6 +24,93 @@ and this file MUST be updated together whenever `__version__` changes.
 
 ---
 
+## [0.8.0-dev10] — Webhook & API security hardening (security)
+
+A full security review of the inbound webhook surface (requested before
+opening a public firewall port for the Meraki receiver) found nine
+issues spanning authentication, exposure, DoS, and replay. This release
+fixes all of them. The theme is **fail closed**: receivers reject
+requests they cannot authenticate, the public ingress exposes only the
+receiver/health paths, and request bodies are bounded everywhere.
+
+### New configuration (core secret / env)
+
+All optional; secure defaults. Set via the `netcortex/core` secret or
+the matching `NETCORTEX_*` env var.
+
+| Key | Default | Purpose |
+| --- | --- | --- |
+| `api_secret` | `""` | When set, `/`, `/api/*`, `/metrics`, docs, and the telemetry SSE monitor require `Authorization: Bearer <api_secret>`. |
+| `webhook_allow_unsigned` | `false` | Master fail-open switch. `false` = reject webhooks for tenants with no configured secret. Enable only to bootstrap a new receiver. |
+| `webhook_max_body_bytes` | `1048576` (1 MiB) | Hard cap on webhook/telemetry request bodies (413 over cap). |
+| `webhook_replay_window_seconds` | `300` | Reject webhooks whose trusted timestamp (e.g. Meraki `sentAt`) is outside this window. `0` disables. |
+| `telemetry_secret` | `""` | Shared `X-Telemetry-Token` required on the HTTP telemetry-push ingest. |
+| `cors_allow_origins` | `[]` | Explicit browser-origin allow-list. We never ship `*`. |
+
+### Findings fixed
+
+- **F1 — HMAC/token auth failed open when no secret was configured.**
+  `meraki.py` and `catalyst_center.py` now **fail closed** (503) when no
+  signing secret is provisioned for a tenant, unless
+  `webhook_allow_unsigned=true`. Previously they accepted the request
+  with only a warning.
+- **F2 — Entire API + topology exposed unauthenticated on the public
+  port.** Two layers: (a) a new app-level `_api_auth` middleware gates
+  every non-receiver path behind `api_secret` when set; (b) the Helm
+  ingress now defaults to `exposeApi=false`, publishing only
+  `/webhooks`, `/ingest`, and `/health` — the UI/API/metrics/MCP stay
+  cluster-internal unless `exposeApi=true` is opted into.
+- **F3 — No request body-size limit (memory-exhaustion DoS).** New
+  in-handler `Content-Length` + materialized-body guards (413) plus an
+  ingress `proxy-body-size: 1m` annotation.
+- **F4 — Unauthenticated amplification via background adapter sync.**
+  Webhook-driven syncs now funnel through a coalescing scheduler
+  (`sync_coalesce.py`): single-flight + trailing coalesce + min-interval
+  + global concurrency cap. The generic catch-all endpoint is now gated
+  behind the administrative `api_secret`.
+- **F5 — Non-constant-time token comparison (Catalyst Center).** Now
+  uses `hmac.compare_digest`.
+- **F6 — Unauthenticated telemetry ingest + SSE stream.** Ingest
+  requires `X-Telemetry-Token` (`telemetry_secret`); the SSE monitor is
+  gated behind `api_secret`. Both are body-size capped.
+- **F7 — Nexus Dashboard API key never verified.** New dedicated
+  `nexus_dashboard.py` handler verifies `X-ND-API-Key` in constant time
+  and fails closed.
+- **F8 — Broad CORS + info leak via `/api` and `/metrics`.** CORS no
+  longer ships `*` (explicit allow-list via `NETCORTEX_CORS_ALLOW_ORIGINS`,
+  default none); `/metrics` and `/api/*` are covered by `_api_auth`.
+- **F9 — No webhook replay protection.** Meraki deliveries are rejected
+  (403) when `sentAt` falls outside `webhook_replay_window_seconds`.
+
+### Shared hardening module
+
+New `netcortex/webhooks/auth.py` centralizes body-size enforcement,
+fail-closed gating, constant-time comparison, replay checks, and the
+admin/telemetry token gates — so every current and future receiver
+inherits the same controls in one place (the same consolidation that
+would have prevented the dev9 per-vendor regression).
+
+### Operational notes
+
+- **The status UI is no longer public by default.** After deploy, reach
+  it via `kubectl port-forward svc/<release>-web 8000:8000`, or set
+  `ingress.exposeApi=true` **and** an `api_secret`.
+- Store webhook secrets at `netcortex/webhooks/<vendor>/<instance>`
+  (`shared_secret`, or `api_key` for Nexus Dashboard) before the
+  receiver will accept traffic.
+
+### Tests
+
+- `tests/webhooks/test_auth_helpers.py` — the shared auth/guard helpers.
+- `tests/webhooks/test_other_webhook_routes.py` — Catalyst Center,
+  Nexus Dashboard, generic, and telemetry route auth.
+- `tests/webhooks/test_sync_coalesce.py` — coalescing scheduler.
+- `tests/test_api_auth.py` — API-auth middleware + path classification.
+- Updated `tests/webhooks/test_meraki_webhook_route.py` for fail-closed,
+  replay (403), and body-size (413) behavior.
+
+---
+
 ## [0.8.0-dev9] — Fix webhook HMAC verify silently failing open (security)
 
 **Pre-existing bug caught by the dev8 deploy.** While verifying the

@@ -108,9 +108,43 @@ The **instance ID** used throughout NetCortex (MCP tools, sync status, logs, Net
   "ssh_timeout": 30,
   "netconf_port": 830,
   "restconf_port": 443,
-  "status_refresh_interval": 30
+  "status_refresh_interval": 30,
+
+  "api_secret": "random-32-byte-hex-secret",
+  "webhook_allow_unsigned": false,
+  "webhook_max_body_bytes": 1048576,
+  "webhook_replay_window_seconds": 300,
+  "telemetry_secret": "random-32-byte-hex-secret",
+  "cors_allow_origins": []
 }
 ```
+
+### HTTP API & webhook security keys (0.8.0-dev10)
+
+All optional with secure defaults. Each also has a `NETCORTEX_*` env
+equivalent for bootstrap before the backend is reachable.
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `api_secret` | `""` | When set, every non-receiver HTTP path (`/`, `/api/*`, `/metrics`, docs, telemetry SSE) requires `Authorization: Bearer <api_secret>`. Leave empty only when the API is reached solely cluster-internally (the default ingress keeps it private). |
+| `webhook_allow_unsigned` | `false` | Master fail-open switch. `false` = a webhook for a tenant with **no** configured secret is rejected (503). Set `true` only to bootstrap a brand-new receiver before its secret is stored, then turn it back off. |
+| `webhook_max_body_bytes` | `1048576` | Hard body-size cap (413 over cap). Keep aligned with the ingress `proxy-body-size`. |
+| `webhook_replay_window_seconds` | `300` | Reject webhooks whose trusted timestamp (e.g. Meraki `sentAt`) is outside ±this window. `0` disables. |
+| `telemetry_secret` | `""` | Shared token required in `X-Telemetry-Token` on `POST /ingest/telemetry/{device}`. Fails closed when unset (unless `webhook_allow_unsigned`). |
+| `cors_allow_origins` | `[]` | Browser-origin allow-list. Never `*`. The bundled UI is same-origin so it needs none. |
+
+#### Per-vendor webhook secrets
+
+Stored at `netcortex/webhooks/<vendor>/<instance_name>`:
+
+```json
+// netcortex/webhooks/meraki/<instance>            → {"shared_secret": "..."}
+// netcortex/webhooks/catalyst_center/<instance>   → {"shared_secret": "..."}
+// netcortex/webhooks/nexus_dashboard/<instance>   → {"api_key": "..."}
+```
+
+A receiver **rejects all traffic (503)** until its secret is provisioned
+(fail closed), unless `webhook_allow_unsigned=true`.
 
 ### `netcortex/devices/site/building-a` example
 

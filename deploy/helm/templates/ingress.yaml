@@ -5,8 +5,17 @@ metadata:
   name: {{ include "netcortex.fullname" . }}
   labels:
     {{- include "netcortex.labels" . | nindent 4 }}
-  {{- with .Values.ingress.annotations }}
   annotations:
+    # Body-size cap (F3, 0.8.0-dev10): outermost defense against
+    # memory-exhaustion via large unauthenticated POST bodies. Keep aligned
+    # with the in-app webhook_max_body_bytes guard (default 1 MiB).
+    nginx.ingress.kubernetes.io/proxy-body-size: {{ .Values.ingress.proxyBodySize | quote }}
+    # Per-source request-rate cap (defense-in-depth against webhook floods).
+    {{- if .Values.ingress.rateLimit.enabled }}
+    nginx.ingress.kubernetes.io/limit-rps: {{ .Values.ingress.rateLimit.rps | quote }}
+    nginx.ingress.kubernetes.io/limit-connections: {{ .Values.ingress.rateLimit.connections | quote }}
+    {{- end }}
+  {{- with .Values.ingress.annotations }}
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
@@ -23,6 +32,10 @@ spec:
     - host: {{ .Values.ingress.hostname }}
       http:
         paths:
+          {{- if .Values.ingress.exposeApi }}
+          # exposeApi=true: the whole app (status UI, /api, /metrics, /mcp)
+          # is reachable on this host. ONLY do this on a trusted network or
+          # with api_secret set so /api and /metrics require a bearer token.
           - path: /
             pathType: Prefix
             backend:
@@ -30,4 +43,19 @@ spec:
                 name: {{ include "netcortex.fullname" . }}-web
                 port:
                   number: {{ .Values.service.port }}
+          {{- else }}
+          # Default (F2, 0.8.0-dev10): expose ONLY the public receiver and
+          # health surface. The status UI, topology/inventory API, metrics,
+          # and MCP endpoint stay cluster-internal (reach them via
+          # `kubectl port-forward` or a separate internal-only ingress).
+          {{- range .Values.ingress.publicPaths }}
+          - path: {{ . }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "netcortex.fullname" $ }}-web
+                port:
+                  number: {{ $.Values.service.port }}
+          {{- end }}
+          {{- end }}
 {{- end }}

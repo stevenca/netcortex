@@ -11,13 +11,17 @@ Reference: https://developer.cisco.com/meraki/webhooks/
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 from typing import TYPE_CHECKING, Any
 
 import structlog
 from fastapi import BackgroundTasks, HTTPException, status
+
+from netcortex.webhooks.auth import (
+    is_timestamp_fresh,
+    reject_if_unsigned,
+    verify_hmac_sha256,
+)
 
 if TYPE_CHECKING:
     from netcortex.thalamus import SensoryPublisher
@@ -74,18 +78,12 @@ async def _get_shared_secret(instance_name: str) -> str | None:
 
 
 def _verify_signature(body: bytes, signature_header: str | None, shared_secret: str) -> bool:
-    """Return True if the Meraki HMAC-SHA256 signature is valid."""
-    if not signature_header:
-        return False
-    # Meraki sends the raw hex digest (no "sha256=" prefix in older versions;
-    # newer versions may add it — strip it for compatibility).
-    received = signature_header.removeprefix("sha256=").strip()
-    expected = hmac.new(
-        shared_secret.encode("utf-8"),
-        body,
-        hashlib.sha256,
-    ).hexdigest()
-    return hmac.compare_digest(expected, received)
+    """Return True if the Meraki HMAC-SHA256 signature is valid.
+
+    Thin wrapper over the shared :func:`netcortex.webhooks.auth.verify_hmac_sha256`
+    so all vendors use one constant-time implementation.
+    """
+    return verify_hmac_sha256(body, signature_header, shared_secret)
 
 
 async def handle_meraki_webhook(
@@ -128,16 +126,30 @@ async def handle_meraki_webhook(
                 detail="Invalid Meraki webhook signature",
             )
     else:
-        log.warning(
-            "webhook.meraki.no_secret_configured",
-            instance=instance_name,
-            hint="Store shared_secret at netcortex/webhooks/meraki/<instance_name>",
-        )
+        # Fail closed (0.8.0-dev10): a tenant with no configured secret is
+        # rejected (503) unless the operator opted into the explicit
+        # bootstrap switch. Previously this branch accepted the webhook.
+        reject_if_unsigned(kind="meraki", instance_name=instance_name)
 
     try:
         payload: dict[str, Any] = json.loads(body)
     except Exception:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON body")
+
+    # Replay resistance (0.8.0-dev10): Meraki stamps each alert with an ISO
+    # `sentAt`. Reject stale deliveries (captured-and-replayed payloads)
+    # outside the configured freshness window. Only enforced when a secret
+    # is configured — an unsigned bootstrap request has no integrity anyway.
+    if shared_secret is not None and not is_timestamp_fresh(payload.get("sentAt")):
+        log.warning(
+            "webhook.meraki.stale_timestamp",
+            instance=instance_name,
+            sent_at=payload.get("sentAt"),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Webhook timestamp outside the accepted freshness window",
+        )
 
     event_type = payload.get("alertType") or payload.get("eventType") or "unknown"
     network_id = payload.get("networkId")
@@ -177,12 +189,17 @@ async def handle_meraki_webhook(
             )
 
     # ── Targeted adapter sync (pre-dev8 behavior, retained) ───────────────
-    background_tasks.add_task(
-        _sync_meraki_network,
-        instance_name=instance_name,
-        event_type=event_type,
-        network_id=network_id,
-        payload=payload,
+    # Funneled through the coalescing scheduler (0.8.0-dev10, F4) so a
+    # webhook flood can't spawn unbounded concurrent discoveries.
+    from netcortex.webhooks.sync_coalesce import schedule_sync
+    schedule_sync(
+        f"meraki/{instance_name}",
+        lambda: _sync_meraki_network(
+            instance_name=instance_name,
+            event_type=event_type,
+            network_id=network_id,
+            payload=payload,
+        ),
     )
 
     return {
