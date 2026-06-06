@@ -115,9 +115,58 @@ The **instance ID** used throughout NetCortex (MCP tools, sync status, logs, Net
   "webhook_max_body_bytes": 1048576,
   "webhook_replay_window_seconds": 300,
   "telemetry_secret": "random-32-byte-hex-secret",
-  "cors_allow_origins": []
+  "cors_allow_origins": [],
+
+  "saml_enabled": true,
+  "saml_sp_base_url": "https://netcortex.example.com",
+  "saml_idp_entity_id": "http://www.okta.com/exk1abcd2efGHIJ34k5",
+  "saml_idp_sso_url": "https://example.okta.com/app/abc123/sso/saml",
+  "saml_idp_slo_url": "https://example.okta.com/app/abc123/slo/saml",
+  "saml_idp_x509_cert": "MIIDxxxx...single-line-or-PEM...",
+  "saml_allowed_email_domains": ["example.com"],
+  "saml_allowed_groups": ["netops", "netcortex-admins"]
 }
 ```
+
+### SAML SSO & session keys (0.8.0-dev11)
+
+In-app SAML 2.0 Service Provider gating human UI/API access. All optional
+(off by default). **Preferred: configure via Helm values** (`saml:` /
+`session:` blocks in `values.yaml` / `values-local.yaml`) — the IdP URLs
+and the IdP's public signing cert are non-secret, so they're injected as
+`NETCORTEX_SAML_*` env on the web pod rather than stored in the secret
+backend. Any key present in `netcortex/core` still overrides the env
+value. The only sensitive piece — the optional SP **private key** for
+signing AuthnRequests (`saml_sp_private_key`) — is read from the secret
+backend only, never from env/values.
+
+| Key | Purpose |
+| --- | --- |
+| `saml_enabled` | Master switch. When true, browser access to the UI/API requires an Okta login; machines keep using `api_secret`/HMAC. |
+| `saml_sp_base_url` | Public https origin of this app (e.g. `https://netcortex.example.com`). ACS/SLS/metadata URLs are derived from it. |
+| `saml_sp_entity_id` | SP entityId. Defaults to `<base>/saml/metadata`. |
+| `saml_idp_entity_id`, `saml_idp_sso_url`, `saml_idp_slo_url` | From the Okta app's SAML setup instructions. |
+| `saml_idp_x509_cert` | Okta signing certificate — verifies signed assertions. |
+| `saml_sp_x509_cert`, `saml_sp_private_key` | Optional SP keypair to sign AuthnRequests/SLO. |
+| `saml_allowed_email_domains`, `saml_allowed_groups` | Optional coarse authz. Empty = any authenticated IdP user. |
+| `saml_attr_groups` | SAML attribute name carrying group membership (default `groups`). |
+| `session_cookie_name` | Session cookie name (default `nc_session`). |
+| `session_cookie_secure` | `Secure` flag on the cookie (default true; set false only for local http dev). |
+| `session_idle_timeout_seconds` | Idle session lifetime (default 1800). |
+| `session_absolute_timeout_seconds` | Absolute (non-extendable) lifetime (default 28800). |
+
+**Okta application setup:**
+
+1. Create a SAML 2.0 app in Okta.
+2. Single sign-on URL / ACS: `https://<host>/saml/acs`
+3. Audience URI (SP entityId): `https://<host>/saml/metadata`
+4. Name ID format: `EmailAddress`; application username: email.
+5. (Optional) Add a `groups` attribute statement for group-based authz.
+6. Copy the IdP entityId, SSO URL, SLO URL, and signing cert into the
+   keys above. You can also fetch this app's SP metadata from
+   `GET https://<host>/saml/metadata`.
+7. Set `ingress.exposeApi=true` and `ingress.adminAllowSourceRanges` to
+   your office/VPN CIDRs so the UI is reachable but IP-restricted.
 
 ### HTTP API & webhook security keys (0.8.0-dev10)
 

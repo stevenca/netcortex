@@ -24,6 +24,93 @@ and this file MUST be updated together whenever `__version__` changes.
 
 ---
 
+## [0.8.0-dev11] — SAML SSO + IP allow-listing in front of the UI (security)
+
+Builds on the dev10 hardening: puts a **SAML 2.0 login (Okta)** in front
+of human access to the UI/API, and adds **per-surface IP allow-listing**
+at the ingress. Machine traffic is untouched — MCP and `api_secret`
+bearer callers and the webhook/telemetry receivers keep their existing
+auth and bypass SSO.
+
+### SAML Service Provider (in-app)
+
+- New `netcortex/auth/` package: `saml.py` (python3-saml SP), `session.py`
+  (Redis-backed sessions), `router.py` (the SSO endpoints).
+- Endpoints (self-disable with 404 when `saml_enabled=false`):
+  `GET /saml/login`, `POST /saml/acs`, `GET /saml/metadata`,
+  `GET /saml/logout`, `GET|POST /saml/sls`.
+- The `_api_auth` middleware now accepts **either** a valid `api_secret`
+  bearer (machines) **or** a valid SAML session cookie (humans). An
+  unauthenticated browser navigation is 302-redirected to `/saml/login`
+  (preserving the target via `?next=`); an unauthenticated API/XHR call
+  gets 401. `/webhooks`, `/ingest`, `/health`, `/saml`, and the MCP mount
+  stay public (they authenticate themselves).
+- Hardened SAML: `strict=True`, `wantAssertionsSigned`, SHA-256
+  signatures/digests, `rejectUnsolicitedResponsesWithInResponseTo`
+  (SP-initiated only), audience/Destination/timestamp validation, and
+  optional email-domain / group authorization. Destination/ACS URLs are
+  derived from the public base URL so validation works behind a
+  TLS-terminating ingress.
+
+### Server-side sessions
+
+- Opaque CSPRNG session id (`secrets.token_urlsafe(32)`) in a
+  `Secure` + `HttpOnly` + `SameSite=Lax`, non-persistent cookie; all
+  subject/email/group data lives in Redis, never the cookie.
+- Idle timeout (default 30 min, slid forward per request) **and**
+  absolute timeout (default 8 h, non-extendable). Lifecycle events log a
+  salted hash of the session id, never the raw token.
+
+### IP allow-listing (ingress)
+
+- Ingress split into a **receiver** ingress (`/webhooks`, `/ingest`,
+  `/health` — always present) and an **admin** ingress (`/` — only when
+  `exposeApi=true`), so the two surfaces can have different allowed
+  source ranges via `nginx whitelist-source-range`.
+- `ingress.adminAllowSourceRanges` (UI/API/MCP) and
+  `ingress.webhookAllowSourceRanges` (receivers). Both default empty;
+  per this change set only the admin surface is expected to be locked to
+  office/VPN CIDRs, with webhooks left open and HMAC/token-protected.
+
+### New configuration (core secret / env)
+
+`saml_enabled`, `saml_sp_base_url`, `saml_sp_entity_id`,
+`saml_idp_entity_id`, `saml_idp_sso_url`, `saml_idp_slo_url`,
+`saml_idp_x509_cert`, `saml_sp_x509_cert`, `saml_sp_private_key`,
+`saml_allowed_email_domains`, `saml_allowed_groups`, `saml_attr_groups`,
+`session_cookie_name`, `session_cookie_secure`,
+`session_idle_timeout_seconds`, `session_absolute_timeout_seconds`.
+Startup logs an error if `saml_enabled` is true but required IdP fields
+are missing.
+
+### Packaging
+
+- `python3-saml` is a new optional extra (`pip install '.[saml]'`,
+  included in `all`); imported lazily so non-SSO deployments don't need
+  it. The Docker image installs `libxmlsec1`/`libxml2` (build + runtime)
+  for xmlsec signature verification.
+
+### Tests
+
+- `tests/auth/test_session.py` — session create/load/destroy, idle slide,
+  absolute expiry, secure cookie flags.
+- `tests/auth/test_saml.py` — hardened settings, authz (domain/group),
+  group extraction, open-redirect-safe return paths.
+- `tests/test_api_auth.py` — extended for SAML browser-redirect, XHR 401,
+  valid-session allow, and bearer-still-works-with-SAML-on.
+
+### Operational notes
+
+- To enable: store the SAML keys in `netcortex/core`, set
+  `saml_enabled=true` and `ingress.exposeApi=true`, set
+  `ingress.adminAllowSourceRanges` to your office/VPN CIDRs, and paste
+  `GET /saml/metadata` (or the SP entityId/ACS URL) into the Okta app.
+- Okta config: SSO URL / ACS = `https://<host>/saml/acs`, Audience /
+  SP entityId = `https://<host>/saml/metadata`, NameID = email; map a
+  `groups` attribute if you use group-based authorization.
+
+---
+
 ## [0.8.0-dev10] — Webhook & API security hardening (security)
 
 A full security review of the inbound webhook surface (requested before

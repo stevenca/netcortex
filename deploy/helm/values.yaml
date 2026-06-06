@@ -84,6 +84,40 @@ web:
   #   value: DEBUG
 
 # -----------------------------------------------------------------------------
+# SAML SSO (0.8.0-dev11) — gates human UI/API access behind an IdP login.
+# All values here are NON-SECRET (IdP URLs + the IdP's public signing cert),
+# so they live in values, not the secret backend. They are injected as
+# NETCORTEX_SAML_* env on the web pod and can still be overridden by the
+# netcortex/core secret if a key is present there. The optional SP private
+# key (for signing AuthnRequests) is the only sensitive piece and is read
+# from the secret backend only.
+# -----------------------------------------------------------------------------
+saml:
+  enabled: false
+  # Public https origin of this app. Empty → defaults to https://<ingress.hostname>.
+  spBaseUrl: ""
+  # SP entityId. Empty → defaults to <spBaseUrl>/saml/metadata.
+  spEntityId: ""
+  idp:
+    entityId: ""          # IdP Issuer / entityID from the IdP metadata
+    ssoUrl: ""            # IdP SingleSignOnService Location
+    sloUrl: ""            # IdP SingleLogoutService (optional; blank if none)
+    x509cert: ""          # IdP signing cert, single-line base64 (public)
+  # Optional coarse authorization. Empty = any authenticated IdP user.
+  allowedEmailDomains: []
+  allowedGroups: []
+  attrGroups: "groups"    # SAML attribute name carrying group membership
+
+# -----------------------------------------------------------------------------
+# Session policy for SAML-authenticated UI sessions (server-side, Redis).
+# -----------------------------------------------------------------------------
+session:
+  cookieName: "nc_session"
+  cookieSecure: true            # set false ONLY for local http dev
+  idleTimeoutSeconds: 1800      # 30 min
+  absoluteTimeoutSeconds: 28800 # 8 h
+
+# -----------------------------------------------------------------------------
 # Worker — Celery async task runner
 # -----------------------------------------------------------------------------
 worker:
@@ -237,6 +271,21 @@ ingress:
     - /webhooks
     - /ingest
     - /health
+
+  # IP allow-lists (0.8.0-dev11). nginx whitelist-source-range, applied
+  # per-ingress so the human UI and the machine receivers can have
+  # different allowed sources.
+  #
+  # adminAllowSourceRanges: CIDRs permitted to reach the UI/API/MCP admin
+  #   ingress (only created when exposeApi=true). Empty = no IP filter
+  #   (rely on SAML SSO + api_secret). Set to your office/VPN egress.
+  # webhookAllowSourceRanges: CIDRs permitted to reach /webhooks + /ingest.
+  #   Empty = open (vendor clouds use dynamic IPs; HMAC/token is the
+  #   control). Populate with vendor egress ranges to lock down later.
+  adminAllowSourceRanges: []
+    # - "203.0.113.0/24"     # office
+    # - "198.51.100.7/32"    # admin VPN
+  webhookAllowSourceRanges: []
 
   # Hard cap on request body size at the ingress (F3). Mirror the in-app
   # webhook_max_body_bytes (default 1 MiB).

@@ -461,6 +461,11 @@ async def _query_budget(request, call_next):
 
 app.include_router(status_router)
 app.include_router(webhook_router)
+# SAML SSO endpoints (0.8.0-dev11). The routes self-disable (404) when
+# saml_enabled is false, and are on the API-auth public allow-list since
+# they ARE the login flow.
+from netcortex.auth.router import router as auth_router  # noqa: E402
+app.include_router(auth_router)
 
 
 @app.post("/api/graph/cache/invalidate", tags=["graph"], status_code=200)
@@ -536,7 +541,10 @@ async def _metrics(request, call_next):
 # budget / metrics).
 
 # Public prefixes that the API-auth gate must NOT block.
-_API_AUTH_PUBLIC_PREFIXES = ("/webhooks", "/ingest", "/health")
+#   /webhooks, /ingest — machine receivers (own HMAC/token auth)
+#   /health            — k8s probes
+#   /saml              — the SSO login flow itself (0.8.0-dev11)
+_API_AUTH_PUBLIC_PREFIXES = ("/webhooks", "/ingest", "/health", "/saml")
 
 
 def _is_api_auth_public(path: str) -> bool:
@@ -551,10 +559,34 @@ def _is_api_auth_public(path: str) -> bool:
     return False
 
 
+def _wants_html(request) -> bool:
+    """True for a top-level browser navigation (so we 302 to login rather
+    than return a 401 an XHR/CLI client can't act on)."""
+    if request.method != "GET":
+        return False
+    accept = request.headers.get("accept", "")
+    return "text/html" in accept
+
+
+async def _has_valid_saml_session(request) -> bool:
+    """Validate the server-side SAML session cookie, if any."""
+    try:
+        from netcortex.auth import session as session_mod
+        sid = session_mod.read_session_id(request)
+        if not sid:
+            return False
+        record = await session_mod.load_session(sid)
+        return record is not None
+    except Exception as exc:  # Redis hiccup, etc. — fail closed (no session).
+        log.warning("api.auth.session_check_failed", error=str(exc))
+        return False
+
+
 @app.middleware("http")
 async def _api_auth(request, call_next):
     import hmac as _hmac
-    from starlette.responses import JSONResponse
+    from urllib.parse import quote
+    from starlette.responses import JSONResponse, RedirectResponse
 
     # CORS preflight must never require auth.
     if request.method == "OPTIONS":
@@ -565,22 +597,45 @@ async def _api_auth(request, call_next):
         return await call_next(request)
 
     try:
-        secret = get_settings().api_secret or ""
+        cfg = get_settings()
+        secret = cfg.api_secret or ""
+        saml_on = bool(getattr(cfg, "saml_enabled", False))
     except RuntimeError:
         secret = ""
+        saml_on = False
 
+    # 1) Machine callers: api_secret bearer (constant-time).
     if secret:
         auth_header = request.headers.get("authorization", "")
         token = auth_header.removeprefix("Bearer ").strip()
-        if not _hmac.compare_digest(token, secret):
-            log.warning("api.auth.denied", path=path, has_header=bool(auth_header))
-            return JSONResponse(
-                status_code=401,
-                content={"error": "unauthorized"},
-                headers={"WWW-Authenticate": 'Bearer realm="NetCortex API"'},
-            )
+        if token and _hmac.compare_digest(token, secret):
+            return await call_next(request)
 
-    return await call_next(request)
+    # 2) Human callers: a valid SAML session cookie (when SAML is on).
+    if saml_on and await _has_valid_saml_session(request):
+        return await call_next(request)
+
+    # 3) Decide how to reject. If neither control is configured, the
+    #    middleware is a no-op (the ingress is the control — see F2).
+    if not secret and not saml_on:
+        return await call_next(request)
+
+    # SAML on + browser navigation → bounce through the IdP login.
+    if saml_on and _wants_html(request):
+        target = request.url.path
+        if request.url.query:
+            target = f"{target}?{request.url.query}"
+        return RedirectResponse(
+            f"/saml/login?next={quote(target, safe='')}",
+            status_code=302,
+        )
+
+    log.warning("api.auth.denied", path=path)
+    return JSONResponse(
+        status_code=401,
+        content={"error": "unauthorized"},
+        headers={"WWW-Authenticate": 'Bearer realm="NetCortex API"'},
+    )
 
 
 @app.get("/metrics", include_in_schema=False)

@@ -45,6 +45,39 @@ spec:
             {{- with .Values.web.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+            {{- if .Values.saml.enabled }}
+            # SAML SSO (0.8.0-dev11) — non-secret IdP config from values.yaml.
+            - name: NETCORTEX_SAML_ENABLED
+              value: "true"
+            - name: NETCORTEX_SAML_SP_BASE_URL
+              value: {{ .Values.saml.spBaseUrl | default (printf "https://%s" .Values.ingress.hostname) | quote }}
+            {{- if .Values.saml.spEntityId }}
+            - name: NETCORTEX_SAML_SP_ENTITY_ID
+              value: {{ .Values.saml.spEntityId | quote }}
+            {{- end }}
+            - name: NETCORTEX_SAML_IDP_ENTITY_ID
+              value: {{ .Values.saml.idp.entityId | quote }}
+            - name: NETCORTEX_SAML_IDP_SSO_URL
+              value: {{ .Values.saml.idp.ssoUrl | quote }}
+            - name: NETCORTEX_SAML_IDP_SLO_URL
+              value: {{ .Values.saml.idp.sloUrl | quote }}
+            - name: NETCORTEX_SAML_IDP_X509_CERT
+              value: {{ .Values.saml.idp.x509cert | quote }}
+            - name: NETCORTEX_SAML_ALLOWED_EMAIL_DOMAINS
+              value: {{ join "," .Values.saml.allowedEmailDomains | quote }}
+            - name: NETCORTEX_SAML_ALLOWED_GROUPS
+              value: {{ join "," .Values.saml.allowedGroups | quote }}
+            - name: NETCORTEX_SAML_ATTR_GROUPS
+              value: {{ .Values.saml.attrGroups | quote }}
+            - name: NETCORTEX_SESSION_COOKIE_NAME
+              value: {{ .Values.session.cookieName | quote }}
+            - name: NETCORTEX_SESSION_COOKIE_SECURE
+              value: {{ .Values.session.cookieSecure | quote }}
+            - name: NETCORTEX_SESSION_IDLE_TIMEOUT_SECONDS
+              value: {{ .Values.session.idleTimeoutSeconds | quote }}
+            - name: NETCORTEX_SESSION_ABSOLUTE_TIMEOUT_SECONDS
+              value: {{ .Values.session.absoluteTimeoutSeconds | quote }}
+            {{- end }}
           volumeMounts:
             - name: data
               mountPath: /app/data
