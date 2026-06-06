@@ -32,6 +32,31 @@ ingress:
     secretName: "netcortex-tls"
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-prod
+  # Expose the UI/API (admin) ingress in addition to the receiver paths.
+  # Required for SAML SSO to have something to protect.
+  exposeApi: true
+  # Restrict the admin UI/API to these source CIDRs (SAML is the second
+  # layer). Empty = no IP filter (SAML only). Fill with your office/VPN
+  # egress ranges, e.g.:
+  adminAllowSourceRanges: []
+    # - "203.0.113.0/24"
+    # - "198.51.100.7/32"
+
+# -----------------------------------------------------------------------------
+# SAML SSO via Duo Security (IdP). Non-secret IdP values from the Duo
+# "Generic SAML Service Provider" metadata. spBaseUrl is omitted → defaults
+# to https://<ingress.hostname>.
+# -----------------------------------------------------------------------------
+saml:
+  enabled: true
+  idp:
+    entityId: "https://sso-dbbfec7f.sso.duosecurity.com/saml2/sp/DIRC8ET0RCU9RTD7A4AP/metadata"
+    ssoUrl: "https://sso-dbbfec7f.sso.duosecurity.com/saml2/sp/DIRC8ET0RCU9RTD7A4AP/sso"
+    sloUrl: ""   # Duo metadata advertises no SingleLogoutService
+    x509cert: "MIIDDTCCAfWgAwIBAgIUIsTRaCpPjS2L5tYmwu4BQyBfuRAwDQYJKoZIhvcNAQELBQAwNjEVMBMGA1UECgwMRHVvIFNlY3VyaXR5MR0wGwYDVQQDDBRESVJDOEVUMFJDVTlSVEQ3QTRBUDAeFw0yNjA2MDYxODMwMzFaFw0zODAxMTkwMzE0MDdaMDYxFTATBgNVBAoMDER1byBTZWN1cml0eTEdMBsGA1UEAwwURElSQzhFVDBSQ1U5UlREN0E0QVAwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDI357wyTOFqIIM5OJdlH4azPaOkau/ALfytCsspSVwQu3LR+3B6vBYOW17dubSRaGoscifQVxfZAHKtKIMw+kVscQswEhmgQSxPsjTtNlO79NTEnQgaO1VnUYreWcAdJsX4lZNQYrwrxsH7whktDowKI7PhFIIFVjZzMrcsitry4cMpbRbzXAufPlTCpgljW9qm7OIVN3zld/wBJcaMxtrYIod0K0aL0co19w/xe3aX0ka10k1+IJrxOJstqlES43YPgchuQV9SwdetN/qjnpjzK3FC3DTuNsfNnXCFfRXYUFH6A7J+/9e33YYdE3sojddI+sXVT7u5EWiimmZyb19AgMBAAGjEzARMA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEBAK1bn0j7zVY34xeIHuEzcJ5TXSiOEzUMYU1FaqlPj3OvFYXEYYb/K8X3ZLd5D757YV4Lr1zq35tdzbdnYigGSxzlq4RGhGdsAmY9SFusQqH/P2JsCika86//UdmDfV5FJBgYfr01DjDK2UZ6ts0rb90DGXUmPWlArxN4gWn5xHYXHZyeHVl/Y91BwLGWBqPI7UPN7RNUvGCDSNMI+jI4gWn8QV7i2hCekvthZ6XlE9PpRtPexJJmOlAofL5k3xhQbJgwJpFE4zOG9OYlTJ1vUDQZiRtZGS4xU1c2Icry2JHUnn89B/7Osh1vvbEzK1dDsSTN59PVh1pRFo18D1u9dhM="
+  # Optional: lock to email domain(s). Empty = any authenticated Duo user.
+  allowedEmailDomains: []
+    # - "cisco.com"
 
 # Tighten resources for a single-node dev cluster
 web:

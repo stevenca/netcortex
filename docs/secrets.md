@@ -131,8 +131,14 @@ The **instance ID** used throughout NetCortex (MCP tools, sync status, logs, Net
 ### SAML SSO & session keys (0.8.0-dev11)
 
 In-app SAML 2.0 Service Provider gating human UI/API access. All optional
-(off by default); each has a `NETCORTEX_*` env bootstrap equivalent
-except the cert/key, which are secrets and must come from the backend.
+(off by default). **Preferred: configure via Helm values** (`saml:` /
+`session:` blocks in `values.yaml` / `values-local.yaml`) — the IdP URLs
+and the IdP's public signing cert are non-secret, so they're injected as
+`NETCORTEX_SAML_*` env on the web pod rather than stored in the secret
+backend. Any key present in `netcortex/core` still overrides the env
+value. The only sensitive piece — the optional SP **private key** for
+signing AuthnRequests (`saml_sp_private_key`) — is read from the secret
+backend only, never from env/values.
 
 | Key | Purpose |
 | --- | --- |

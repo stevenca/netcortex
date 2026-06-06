@@ -276,8 +276,11 @@ class Settings:
         self.saml_idp_entity_id = os.environ.get("NETCORTEX_SAML_IDP_ENTITY_ID", "")
         self.saml_idp_sso_url = os.environ.get("NETCORTEX_SAML_IDP_SSO_URL", "")
         self.saml_idp_slo_url = os.environ.get("NETCORTEX_SAML_IDP_SLO_URL", "")
-        self.saml_idp_x509_cert = ""
-        self.saml_sp_x509_cert = ""
+        # The IdP signing cert is public (it ships in IdP metadata), so it can
+        # be supplied via Helm values/env. The SP private key stays
+        # secret-backend-only (never read from env).
+        self.saml_idp_x509_cert = os.environ.get("NETCORTEX_SAML_IDP_X509_CERT", "")
+        self.saml_sp_x509_cert = os.environ.get("NETCORTEX_SAML_SP_X509_CERT", "")
         self.saml_sp_private_key = ""
         self.saml_allowed_email_domains = _env_csv("NETCORTEX_SAML_ALLOWED_EMAIL_DOMAINS")
         self.saml_allowed_groups = _env_csv("NETCORTEX_SAML_ALLOWED_GROUPS")
