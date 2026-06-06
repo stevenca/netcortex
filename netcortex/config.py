@@ -117,6 +117,36 @@ class Settings:
     mcp_transport: str
     mcp_secret: str
 
+    # HTTP API / webhook security (0.8.0-dev10)
+    #
+    # api_secret: when non-empty, every non-public HTTP route (the status
+    #   UI, /api/*, /metrics, the telemetry SSE monitor) requires
+    #   `Authorization: Bearer <api_secret>`. Empty disables app-level API
+    #   auth — in that mode the *ingress* is the control: the shipped chart
+    #   only exposes the webhook/health receiver paths publicly, so /api
+    #   stays cluster-internal. Set this whenever the API is reachable from
+    #   an untrusted network.
+    # webhook_allow_unsigned: master fail-open switch. Default False =
+    #   fail closed: a webhook for a tenant with no configured secret is
+    #   rejected (503) instead of silently accepted. Set True only to
+    #   bootstrap a brand-new receiver before its secret is provisioned.
+    # webhook_max_body_bytes: hard cap on webhook/telemetry request bodies.
+    #   Requests larger than this are rejected (413) before parsing.
+    # webhook_replay_window_seconds: when a webhook payload carries a
+    #   trusted timestamp (e.g. Meraki `sentAt`), reject it if older than
+    #   this many seconds. 0 disables the freshness check.
+    # telemetry_secret: shared token required (header `X-Telemetry-Token`)
+    #   on the HTTP telemetry-push ingest endpoint. Same fail-closed rules
+    #   as webhook secrets.
+    # cors_allow_origins: explicit allow-list of browser origins. Empty =
+    #   no cross-origin access (same-origin only) — we never ship `*`.
+    api_secret: str
+    webhook_allow_unsigned: bool
+    webhook_max_body_bytes: int
+    webhook_replay_window_seconds: int
+    telemetry_secret: str
+    cors_allow_origins: list[str]
+
     # Sync engine
     sync_backend: str
     sync_conflict_policy: str
@@ -187,6 +217,21 @@ class Settings:
         self.redis_url = os.environ.get("REDIS_URL", "redis://redis:6379/0")
         self.mcp_transport = "http"
         self.mcp_secret = ""
+
+        # HTTP API / webhook security (0.8.0-dev10). Env vars provide the
+        # bootstrap defaults; the core secret can override during hydrate().
+        self.api_secret = os.environ.get("NETCORTEX_API_SECRET", "")
+        self.webhook_allow_unsigned = _env_bool(
+            "NETCORTEX_WEBHOOK_ALLOW_UNSIGNED", default=False
+        )
+        self.webhook_max_body_bytes = _env_int(
+            "NETCORTEX_WEBHOOK_MAX_BODY_BYTES", default=1_048_576  # 1 MiB
+        )
+        self.webhook_replay_window_seconds = _env_int(
+            "NETCORTEX_WEBHOOK_REPLAY_WINDOW_SECONDS", default=300
+        )
+        self.telemetry_secret = os.environ.get("NETCORTEX_TELEMETRY_SECRET", "")
+        self.cors_allow_origins = _env_csv("NETCORTEX_CORS_ALLOW_ORIGINS")
         # Secure-by-default. Override with NETBOX_VERIFY_SSL=0 or
         # core-secret `netbox_verify_ssl=false` for self-signed labs.
         _verify_env = os.environ.get("NETBOX_VERIFY_SSL")
@@ -278,6 +323,40 @@ class Settings:
         self.redis_url = core.get("redis_url") or self.redis_url
         self.mcp_transport = core.get("mcp_transport", self.mcp_transport)
         self.mcp_secret = core.get("mcp_secret", self.mcp_secret)
+
+        # HTTP API / webhook security — core secret overrides env defaults.
+        self.api_secret = core.get("api_secret", self.api_secret)
+        raw_allow_unsigned = core.get("webhook_allow_unsigned", self.webhook_allow_unsigned)
+        if isinstance(raw_allow_unsigned, str):
+            self.webhook_allow_unsigned = raw_allow_unsigned.strip().lower() in {
+                "1", "true", "yes", "on",
+            }
+        else:
+            self.webhook_allow_unsigned = bool(raw_allow_unsigned)
+        self.webhook_max_body_bytes = int(
+            core.get("webhook_max_body_bytes", self.webhook_max_body_bytes)
+        )
+        self.webhook_replay_window_seconds = int(
+            core.get("webhook_replay_window_seconds", self.webhook_replay_window_seconds)
+        )
+        self.telemetry_secret = core.get("telemetry_secret", self.telemetry_secret)
+        raw_cors = core.get("cors_allow_origins", None)
+        if raw_cors is not None:
+            if isinstance(raw_cors, str):
+                self.cors_allow_origins = [
+                    o.strip() for o in raw_cors.split(",") if o.strip()
+                ]
+            elif isinstance(raw_cors, (list, tuple)):
+                self.cors_allow_origins = [str(o).strip() for o in raw_cors if str(o).strip()]
+        # Loud warning if the operator left fail-open enabled — this should
+        # never be true in a production deployment.
+        if self.webhook_allow_unsigned:
+            log.warning(
+                "settings.webhook_allow_unsigned_enabled",
+                hint="Webhooks for tenants without a configured secret will be "
+                     "ACCEPTED. Set webhook_allow_unsigned=false once secrets "
+                     "are provisioned.",
+            )
         self.sync_backend = core.get("sync_backend", self.sync_backend)
         self.sync_conflict_policy = core.get("sync_conflict_policy", self.sync_conflict_policy)
 
@@ -340,6 +419,29 @@ def _require(d: dict[str, Any], key: str, path: str) -> Any:
             f"Add it to your secret backend."
         )
     return d[key]
+
+
+def _env_bool(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, *, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("settings.env_int_invalid", name=name, value=raw, fallback=default)
+        return default
+
+
+def _env_csv(name: str) -> list[str]:
+    raw = os.environ.get(name, "")
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
 
 # ---------------------------------------------------------------------------

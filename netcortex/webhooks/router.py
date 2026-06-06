@@ -22,14 +22,34 @@ import structlog
 from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
+from netcortex.webhooks.auth import (
+    enforce_body_size,
+    enforce_content_length,
+    require_admin_token,
+    require_telemetry_token,
+)
 from netcortex.webhooks.meraki import handle_meraki_webhook
 from netcortex.webhooks.catalyst_center import handle_catalyst_center_webhook
+from netcortex.webhooks.nexus_dashboard import handle_nexus_dashboard_webhook
 from netcortex.webhooks.event_publisher import get_publisher
 from netcortex.webhooks.telemetry import handle_telemetry_push, telemetry_event_stream
 
 log = structlog.get_logger(__name__)
 
 router = APIRouter(tags=["webhooks & telemetry"])
+
+
+async def _read_bounded_body(request: Request) -> bytes:
+    """Read the request body with a hard size cap (F3).
+
+    Rejects (413) on the ``Content-Length`` header first, then re-checks
+    the materialized body in case the header is absent or dishonest. The
+    ingress ``proxy-body-size`` annotation is the outermost gate.
+    """
+    enforce_content_length(request.headers.get("content-length"))
+    body = await request.body()
+    enforce_body_size(body)
+    return body
 
 
 # ── Meraki ────────────────────────────────────────────────────────────────────
@@ -56,7 +76,7 @@ async def meraki_webhook(
     The handler validates the signature then queues a targeted sync of the
     affected network so state is refreshed within seconds of the event.
     """
-    body = await request.body()
+    body = await _read_bounded_body(request)
     log.info(
         "webhook.meraki.received",
         instance=instance_name,
@@ -96,7 +116,7 @@ async def catalyst_center_webhook(
     Store the shared token at:
       ``netcortex/webhooks/catalyst_center`` → ``{"shared_secret": "..."}``
     """
-    body = await request.body()
+    body = await _read_bounded_body(request)
     log.info(
         "webhook.catalyst_center.received",
         instance=instance_name,
@@ -125,20 +145,24 @@ async def nexus_dashboard_webhook(
     background_tasks: BackgroundTasks,
     x_nd_api_key: str | None = Header(None, alias="X-ND-API-Key"),
 ) -> dict[str, str]:
-    """Receive Nexus Dashboard / NDFC event notifications."""
-    body = await request.body()
-    try:
-        payload = json.loads(body)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    """Receive Nexus Dashboard / NDFC event notifications.
 
+    Authenticated with a shared API key (``X-ND-API-Key``). Store it at:
+      ``netcortex/webhooks/nexus_dashboard/<instance_name>`` → ``{"api_key": "..."}``
+    """
+    body = await _read_bounded_body(request)
     log.info(
         "webhook.nexus_dashboard.received",
         instance=instance_name,
-        event_type=payload.get("eventType") or payload.get("type"),
+        bytes=len(body),
+        has_key=x_nd_api_key is not None,
     )
-    background_tasks.add_task(_trigger_sync, "nexus_dashboard", instance_name, payload)
-    return {"status": "queued", "adapter": f"nexus_dashboard/{instance_name}"}
+    return await handle_nexus_dashboard_webhook(
+        instance_name=instance_name,
+        body=body,
+        api_key=x_nd_api_key,
+        background_tasks=background_tasks,
+    )
 
 
 # ── Generic catch-all ─────────────────────────────────────────────────────────
@@ -153,12 +177,19 @@ async def generic_webhook(
     instance_name: str,
     request: Request,
     background_tasks: BackgroundTasks,
+    x_netcortex_token: str | None = Header(None, alias="X-NetCortex-Token"),
 ) -> dict[str, str]:
     """Accept webhooks from platforms without a dedicated handler.
 
-    The payload is logged and queued for a full adapter sync.
+    Because this endpoint can trigger discovery on *any* configured
+    adapter (an amplification vector — F4), it is gated behind the
+    administrative ``api_secret`` (header ``X-NetCortex-Token``). Without
+    an ``api_secret`` configured it is disabled (503) — prefer adding a
+    dedicated, per-vendor authenticated handler instead.
     """
-    body = await request.body()
+    require_admin_token(x_netcortex_token)
+
+    body = await _read_bounded_body(request)
     try:
         payload = json.loads(body)
     except Exception:
@@ -170,7 +201,11 @@ async def generic_webhook(
         instance=instance_name,
         keys=list(payload.keys()) if isinstance(payload, dict) else None,
     )
-    background_tasks.add_task(_trigger_sync, platform, instance_name, payload)
+    from netcortex.webhooks.sync_coalesce import schedule_sync
+    schedule_sync(
+        f"{platform}/{instance_name}",
+        lambda: _trigger_sync(platform, instance_name, payload),
+    )
     return {"status": "queued", "adapter": f"{platform}/{instance_name}"}
 
 
@@ -187,6 +222,7 @@ async def receive_telemetry(
     background_tasks: BackgroundTasks,
     x_collection_id: str | None = Header(None, alias="X-Collection-Id"),
     x_yang_path: str | None = Header(None, alias="X-Yang-Path"),
+    x_telemetry_token: str | None = Header(None, alias="X-Telemetry-Token"),
 ) -> dict[str, Any]:
     """Accept HTTP-push streaming telemetry from network devices.
 
@@ -200,8 +236,12 @@ async def receive_telemetry(
 
     For gRPC dial-out MDT (gNMI Subscribe), see the telemetry-grpc
     sidecar service (port 57500) in the Helm chart.
+
+    Authenticated with a shared ``X-Telemetry-Token`` header (F6); store
+    the token in the core secret as ``telemetry_secret``.
     """
-    body = await request.body()
+    require_telemetry_token(x_telemetry_token)
+    body = await _read_bounded_body(request)
     content_type = request.headers.get("content-type", "application/json")
 
     result = await handle_telemetry_push(
@@ -220,12 +260,17 @@ async def receive_telemetry(
     summary="SSE stream of ingest events",
     response_class=StreamingResponse,
 )
-async def telemetry_sse_stream(request: Request) -> StreamingResponse:
+async def telemetry_sse_stream(
+    request: Request,
+    x_netcortex_token: str | None = Header(None, alias="X-NetCortex-Token"),
+) -> StreamingResponse:
     """Server-Sent Events stream of recent telemetry ingest activity.
 
-    Useful for real-time monitoring of what data is flowing in.
-    Connect with:  curl -N https://.../ingest/telemetry/stream
+    Streams operational data, so it is gated behind the administrative
+    ``api_secret`` (header ``X-NetCortex-Token``) — F6. Connect with:
+      curl -N -H "X-NetCortex-Token: <api_secret>" https://.../ingest/telemetry/stream
     """
+    require_admin_token(x_netcortex_token)
     return StreamingResponse(
         telemetry_event_stream(request),
         media_type="text/event-stream",

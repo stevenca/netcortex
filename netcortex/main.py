@@ -366,15 +366,29 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# CORS (F8, 0.8.0-dev10): never ship a wildcard. The bundled UI is served
+# same-origin (from "/") so it needs no cross-origin grant. Browser-based
+# MCP/web agents that call from another origin must be explicitly allow-
+# listed via NETCORTEX_CORS_ALLOW_ORIGINS (comma-separated). Empty = no
+# cross-origin access. This is read from the environment (not the secret
+# backend) because middleware is wired at import time, before settings
+# hydrate; origins are not secret.
+_CORS_ALLOW_ORIGINS = [
+    o.strip()
+    for o in os.environ.get("NETCORTEX_CORS_ALLOW_ORIGINS", "").split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_CORS_ALLOW_ORIGINS,
     # MCP clients (Cursor / Claude / web agents) preflight with OPTIONS
     # and DELETE (DELETE is used to terminate streamable-http sessions),
     # so the public CORS surface needs to include those verbs.
     allow_methods=["GET", "POST", "OPTIONS", "DELETE"],
     allow_headers=["*"],
 )
+if _CORS_ALLOW_ORIGINS:
+    log.info("netcortex.cors.configured", origins=_CORS_ALLOW_ORIGINS)
 
 # Mount the MCP HTTP transport.  This MUST happen AFTER ``app`` is
 # created but BEFORE the catch-all routes — Starlette resolves mounts
@@ -498,6 +512,75 @@ async def _metrics(request, call_next):
         _REQ_LATENCY_SUM[norm] = _REQ_LATENCY_SUM.get(norm, 0.0) + elapsed
         _REQ_LATENCY_COUNT[norm] = _REQ_LATENCY_COUNT.get(norm, 0) + 1
     return response
+
+
+# ── API authentication (F2 / F8, 0.8.0-dev10) ─────────────────────────────────
+#
+# When ``api_secret`` is configured, every request EXCEPT the public
+# receiver/health surface requires ``Authorization: Bearer <api_secret>``.
+# This protects the status UI ("/"), the topology/inventory API ("/api/*"),
+# the OpenAPI docs, and the Prometheus "/metrics" endpoint — all of which
+# leak full network state and were previously unauthenticated.
+#
+# When ``api_secret`` is empty the middleware is a no-op: in that mode the
+# *ingress* is the control (the shipped chart only exposes the webhook and
+# health paths publicly, so /api stays cluster-internal). Set api_secret
+# whenever the API may be reached from an untrusted network.
+#
+# Paths that authenticate themselves or must stay public are skipped:
+#   * /webhooks/*  — per-vendor HMAC / token auth (and fail-closed)
+#   * /ingest/*    — telemetry token / admin token auth
+#   * /health      — k8s liveness/readiness probes
+#   * the MCP mount — its own Bearer(mcp_secret) middleware
+# Registered last so it is the OUTERMOST middleware (runs before query
+# budget / metrics).
+
+# Public prefixes that the API-auth gate must NOT block.
+_API_AUTH_PUBLIC_PREFIXES = ("/webhooks", "/ingest", "/health")
+
+
+def _is_api_auth_public(path: str) -> bool:
+    if path == "/health":
+        return True
+    for prefix in _API_AUTH_PUBLIC_PREFIXES:
+        if path == prefix or path.startswith(prefix + "/"):
+            return True
+    # The MCP mount enforces its own Bearer(mcp_secret); don't double-gate.
+    if path == _MCP_PATH or path.startswith(_MCP_PATH + "/"):
+        return True
+    return False
+
+
+@app.middleware("http")
+async def _api_auth(request, call_next):
+    import hmac as _hmac
+    from starlette.responses import JSONResponse
+
+    # CORS preflight must never require auth.
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    path = request.url.path
+    if _is_api_auth_public(path):
+        return await call_next(request)
+
+    try:
+        secret = get_settings().api_secret or ""
+    except RuntimeError:
+        secret = ""
+
+    if secret:
+        auth_header = request.headers.get("authorization", "")
+        token = auth_header.removeprefix("Bearer ").strip()
+        if not _hmac.compare_digest(token, secret):
+            log.warning("api.auth.denied", path=path, has_header=bool(auth_header))
+            return JSONResponse(
+                status_code=401,
+                content={"error": "unauthorized"},
+                headers={"WWW-Authenticate": 'Bearer realm="NetCortex API"'},
+            )
+
+    return await call_next(request)
 
 
 @app.get("/metrics", include_in_schema=False)

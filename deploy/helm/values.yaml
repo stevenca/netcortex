@@ -220,6 +220,34 @@ ingress:
   # annotations:
   #   route.openshift.io/termination: edge
 
+  # ---------------------------------------------------------------------------
+  # Public exposure surface (0.8.0-dev10 security hardening)
+  # ---------------------------------------------------------------------------
+  # exposeApi=false (default, SECURE): the public ingress serves ONLY the
+  # webhook/telemetry receiver and health paths below. The status UI, the
+  # topology/inventory API (/api/*), /metrics, and the MCP endpoint stay
+  # cluster-internal. Reach them with `kubectl port-forward svc/<name>-web
+  # 8000:8000` or a separate internal-only ingress.
+  #
+  # exposeApi=true: serve the WHOLE app on this host. Only do this on a
+  # trusted network, or set `api_secret` in the core secret so /api,
+  # /metrics, /mcp, and the UI require `Authorization: Bearer <api_secret>`.
+  exposeApi: false
+  publicPaths:
+    - /webhooks
+    - /ingest
+    - /health
+
+  # Hard cap on request body size at the ingress (F3). Mirror the in-app
+  # webhook_max_body_bytes (default 1 MiB).
+  proxyBodySize: "1m"
+
+  # Per-source rate limiting (defense-in-depth against webhook floods).
+  rateLimit:
+    enabled: true
+    rps: 20            # requests/second per client IP
+    connections: 10    # concurrent connections per client IP
+
 # -----------------------------------------------------------------------------
 # Service Account
 # -----------------------------------------------------------------------------

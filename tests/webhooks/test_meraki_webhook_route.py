@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -36,13 +37,19 @@ def _sign(body: bytes, secret: str) -> str:
     return hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
 
-def _port_disconnected_payload() -> dict[str, Any]:
+def _now_iso() -> str:
+    """Current UTC time as an ISO8601 'Z' string (fresh for the replay
+    guard added in 0.8.0-dev10)."""
+    return datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _port_disconnected_payload(sent_at: str | None = None) -> dict[str, Any]:
     """Realistic Meraki port-disconnect payload (sanitized identifiers)."""
     return {
         "alertType": "Port connectivity",
         "alertTypeId": "port_connectivity",
         "version": "0.1",
-        "sentAt": "2026-06-05T20:00:00Z",
+        "sentAt": sent_at or _now_iso(),
         "organizationId": "EXAMPLE_ORG",
         "organizationName": "Example Org",
         "networkId": "L_EXAMPLE001",
@@ -168,14 +175,19 @@ def test_signature_prefix_sha256_accepted(
 def test_malformed_json_returns_400(
     webhook_client: TestClient,
     capturing_bus: CapturingEventBus,
-    meraki_no_secret: None,
+    meraki_shared_secret: str,
 ) -> None:
+    # A correctly-signed but non-JSON body: signature passes, parsing fails.
     body = b"this is not json at all"
+    sig = _sign(body, meraki_shared_secret)
 
     resp = webhook_client.post(
         "/webhooks/meraki/TEST_TENANT",
         content=body,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "X-Cisco-Meraki-Signature": sig,
+        },
     )
 
     assert resp.status_code == 400
@@ -183,22 +195,42 @@ def test_malformed_json_returns_400(
 
 
 # ---------------------------------------------------------------------------
-# No-secret-configured degradation
+# Fail-closed: no-secret-configured (0.8.0-dev10, F1)
 # ---------------------------------------------------------------------------
 
 
-def test_no_secret_configured_still_publishes_with_warning(
+def test_no_secret_configured_rejected_503(
     webhook_client: TestClient,
     capturing_bus: CapturingEventBus,
     meraki_no_secret: None,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """When the per-tenant secret isn't in the backend, the handler
-    accepts the request and logs a loud warning. We still process the
-    event (operators bootstrapping the integration would otherwise
-    see no events at all and assume the pipeline is broken)."""
-    import logging
-    caplog.set_level(logging.WARNING)
+    """When no signing secret is configured for the tenant, the receiver
+    now FAILS CLOSED (503) instead of silently accepting the unsigned
+    request. Pre-dev10 this returned 200."""
+    body = json.dumps(_port_disconnected_payload()).encode()
+
+    resp = webhook_client.post(
+        "/webhooks/meraki/TEST_TENANT",
+        content=body,
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert resp.status_code == 503
+    assert capturing_bus.published == []
+
+
+def test_no_secret_bootstrap_allows_when_flag_set(
+    webhook_client: TestClient,
+    capturing_bus: CapturingEventBus,
+    meraki_no_secret: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The explicit ``webhook_allow_unsigned`` bootstrap switch lets an
+    unsigned request through (with a loud warning) so operators can
+    validate the receive path before provisioning the secret."""
+    from netcortex.webhooks import auth as auth_module
+
+    monkeypatch.setattr(auth_module, "_allow_unsigned", lambda: True)
     body = json.dumps(_port_disconnected_payload()).encode()
 
     resp = webhook_client.post(
@@ -209,6 +241,65 @@ def test_no_secret_configured_still_publishes_with_warning(
 
     assert resp.status_code == 200
     assert len(capturing_bus.published) == 1
+
+
+# ---------------------------------------------------------------------------
+# Replay resistance (0.8.0-dev10, F9)
+# ---------------------------------------------------------------------------
+
+
+def test_stale_timestamp_rejected_403(
+    webhook_client: TestClient,
+    capturing_bus: CapturingEventBus,
+    meraki_shared_secret: str,
+) -> None:
+    """A correctly-signed payload whose ``sentAt`` is far outside the
+    freshness window is rejected as a replay."""
+    stale = (datetime.now(tz=timezone.utc) - timedelta(hours=2)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    body = json.dumps(_port_disconnected_payload(sent_at=stale)).encode()
+    sig = _sign(body, meraki_shared_secret)
+
+    resp = webhook_client.post(
+        "/webhooks/meraki/TEST_TENANT",
+        content=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Cisco-Meraki-Signature": sig,
+        },
+    )
+
+    assert resp.status_code == 403
+    assert capturing_bus.published == []
+
+
+# ---------------------------------------------------------------------------
+# Body-size cap (0.8.0-dev10, F3)
+# ---------------------------------------------------------------------------
+
+
+def test_oversized_body_rejected_413(
+    webhook_client: TestClient,
+    capturing_bus: CapturingEventBus,
+    meraki_shared_secret: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A body larger than the configured cap is rejected (413) before
+    parsing — even with a valid Content-Length header."""
+    from netcortex.webhooks import auth as auth_module
+
+    monkeypatch.setattr(auth_module, "_max_body_bytes", lambda: 1024)
+    big = b"x" * 4096
+
+    resp = webhook_client.post(
+        "/webhooks/meraki/TEST_TENANT",
+        content=big,
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert resp.status_code == 413
+    assert capturing_bus.published == []
 
 
 # ---------------------------------------------------------------------------
