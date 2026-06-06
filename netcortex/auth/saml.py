@@ -97,6 +97,14 @@ def build_settings(cfg: "Settings") -> dict[str, Any]:
             "wantNameId": True,
             "wantNameIdEncrypted": False,
             "wantAssertionsEncrypted": False,
+            # Do NOT require an <AttributeStatement>: a signed assertion
+            # carrying only a NameID is valid for us (we derive the email
+            # from an emailAddress-format NameID). Duo sends NameID-only
+            # assertions unless attribute release is configured, and the
+            # default (True) rejects them. This relaxes ONLY the optional
+            # attribute element — signature/audience/Destination/timestamp
+            # validation is unaffected.
+            "wantAttributeStatement": False,
             "requestedAuthnContext": False,
             "rejectUnsolicitedResponsesWithInResponseTo": True,
             "signatureAlgorithm": _RSA_SHA256,

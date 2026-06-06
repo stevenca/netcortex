@@ -37,6 +37,9 @@ def test_build_settings_is_strict_and_hardened() -> None:
     assert s["strict"] is True
     sec = s["security"]
     assert sec["wantAssertionsSigned"] is True
+    # NameID-only assertions (no AttributeStatement) must be accepted —
+    # Duo sends these unless attribute release is configured.
+    assert sec["wantAttributeStatement"] is False
     assert sec["rejectUnsolicitedResponsesWithInResponseTo"] is True
     assert "rsa-sha256" in sec["signatureAlgorithm"]
     assert "sha256" in sec["digestAlgorithm"]
